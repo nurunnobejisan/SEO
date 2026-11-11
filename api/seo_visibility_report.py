@@ -18,6 +18,7 @@ import argparse
 import copy
 import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 
 try:
@@ -40,24 +41,106 @@ except ImportError:  # falls back to pypdf
     except ImportError:
         pymupdf = None
 
-# STRICT BRAND EXCLUSION RULE - Parent Chains and all Sub-Brands
+# STRICT BRAND EXCLUSION RULE - Parent Chains, Sub-Brands, and Common Misspellings
 ALL_CHAIN_BRANDS = [
-    "marriott", "bonvoy", "ihg", "hilton", "hyatt",
-    "edition", "ritz carlton", "ritz-carlton", "luxury collection", "st regis", "st. regis", "w hotels",
-    "sheraton", "delta hotels", "westin", "le meridien", "le méridien", "renaissance",
+    "marriott", "mariott", "marriot", "bonvoy", "ihg", "hilton", "hyatt",
+    "edition", "ritz carlton", "ritz-carlton", "luxury collection", "st regis", "st. regis", "w hotels", "w hotel",
+    "sheraton", "delta hotels", "westin", "le meridien", "le méridien", "renaissance", "renassance", "renaisance",
     "autograph collection", "tribute portfolio", "design hotels", "gaylord",
-    "courtyard", "four points", "springhill suites", "fairfield", "ac hotels", "citizenm",
+    "courtyard", "four points", "springhill suites", "fairfield", "ac hotels", "ac hotel", "citizenm",
     "aloft", "moxy", "protea", "residence inn", "towneplace suites", "element",
     "six senses", "regent", "intercontinental", "vignette", "kimpton", "hotel indigo",
     "crowne plaza", "even hotels", "voco", "holiday inn", "avid hotels",
     "staybridge suites", "candlewood suites",
     "waldorf astoria", "lxr", "conrad", "nomad", "signia", "canopy",
     "curio collection", "graduate", "doubletree", "tapestry collection", "embassy suites",
-    "tempo", "motto", "hampton", "tru", "spark", "homewood suites", "home2 suites",
+    "tempo", "motto", "hampton", "tru", "spark", "homewood suites", "home2 suites", "hilton garden inn",
     "park hyatt", "alila", "miraval", "andaz", "thompson", "the standard",
     "dream hotels", "grand hyatt", "hyatt regency", "hyatt centric", "hyatt place", "hyatt house",
-    "urcove", "zoetry", "zoëtry", "secrets resorts"
+    "urcove", "zoetry", "zoëtry", "secrets resorts",
+    "best western", "wyndham", "baymont", "days inn", "super 8", "la quinta", "ramada",
+    "comfort inn", "comfort suites", "quality inn", "sleep inn", "clarion", "econo lodge", "rodeway inn",
+    "cambria", "radisson", "country inn", "sonesta", "red roof", "motel 6", "drury", "omni", "loews",
+    "four seasons", "fairmont", "sofitel", "novotel", "ibis", "mercure", "mandarin oriental",
+    "peninsula", "rosewood", "langham", "hard rock", "margaritaville", "virgin hotels", "ace hotel",
+    "1 hotel", "proper hotel", "pendry", "montage", "auberge", "provenance", "mcmenamins", "oxford suites", "shilo inn"
 ]
+
+KNOWN_LOCATIONS = {
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut", "delaware",
+    "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky",
+    "louisiana", "maine", "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+    "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey", "new mexico",
+    "new york", "north carolina", "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania",
+    "rhode island", "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont",
+    "virginia", "washington", "west virginia", "wisconsin", "wyoming",
+    "florence", "portland", "denver", "san antonio", "orlando", "cary", "boerne", "alexandria",
+    "new orleans", "salt lake city", "fairhope", "omaha", "bloomington", "detroit", "novi",
+    "arlington", "tahoe", "atlanta", "austin", "baltimore", "boston", "charleston", "charlotte",
+    "chicago", "cincinnati", "cleveland", "columbus", "dallas", "fort worth", "houston",
+    "indianapolis", "jacksonville", "kansas city", "las vegas", "los angeles", "louisville",
+    "memphis", "miami", "milwaukee", "minneapolis", "nashville", "newark", "oakland",
+    "oklahoma city", "philadelphia", "phoenix", "pittsburgh", "raleigh", "richmond",
+    "sacramento", "salt lake", "san diego", "san francisco", "san jose", "savannah", "seattle",
+    "st louis", "tampa", "tucson", "virginia beach", "washington", "scottsdale", "sedona",
+    "napa", "sonoma", "monterey", "carmel", "santa barbara", "palm springs", "anaheim",
+    "irvine", "newport beach", "santa monica", "beverly hills", "pasadena", "long beach",
+    "honolulu", "waikiki", "maui", "kauai", "key west", "fort lauderdale", "west palm beach",
+    "boca raton", "naples", "sarasota", "clearwater", "st petersburg", "daytona", "st augustine",
+    "destin", "pensacola", "panama city", "myrtle beach", "hilton head", "wilmington",
+    "asheville", "knoxville", "chattanooga", "gatlinburg", "pigeon forge", "lexington",
+    "albuquerque", "santa fe", "boise", "spokane", "tacoma", "bellevue", "eugene", "bend", "reno",
+    "park city", "vail", "aspen", "breckenridge", "boulder", "colorado springs", "annapolis",
+    "providence", "newport", "hartford", "new haven", "burlington", "portsmouth"
+}
+
+US_STATE_CODES = {
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia",
+    "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
+    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt",
+    "va", "wa", "wv", "wi", "wy", "dc"
+}
+
+AIRPORT_CODES = {
+    "pdx", "dca", "iad", "bwi", "den", "atl", "ord", "lax", "dfw", "mco", "msy", "slc", "sat",
+    "sfo", "sea", "bos", "mia", "phx", "las", "msp", "dtw", "phl", "clt", "ewr", "jfk", "lga",
+    "san", "tpa", "bna", "aus", "rdu", "stl", "mci", "cvg", "cmh", "ind", "mke", "oma"
+}
+
+HOSPITALITY_WORDS = {
+    "hotel", "hotels", "resort", "resorts", "spa", "spas", "inn", "inns", "suite", "suites",
+    "lodging", "accommodation", "accommodations", "stay", "stays", "motel", "motels", "retreat",
+    "retreats", "getaway", "getaways", "vacation", "vacations", "place", "places", "boutique",
+    "luxury", "luxurious", "modern", "best", "top", "good", "nice", "great", "cheap", "affordable",
+    "budget", "discount", "deal", "deals", "package", "packages", "special", "specials", "offer",
+    "offers", "rate", "rates", "all", "inclusive", "romantic", "family", "friendly", "pet", "dog",
+    "dogs", "adults", "only", "kid", "kids", "couples", "group", "groups", "corporate", "business",
+    "executive", "extended", "weekend", "night", "day", "overnight", "star", "stars", "rated",
+    "upscale", "unique", "trendy", "cozy", "quiet", "room", "rooms", "bedroom", "bedrooms", "bed",
+    "beds", "king", "queen", "double", "view", "views", "balcony", "balconies", "patio", "terrace",
+    "rooftop", "pool", "pools", "indoor", "outdoor", "heated", "jacuzzi", "hot", "tub", "tubs",
+    "whirlpool", "sauna", "massage", "facial", "wellness", "fitness", "gym", "breakfast", "free",
+    "complimentary", "parking", "valet", "shuttle", "wifi", "kitchen", "fireplace", "restaurant",
+    "restaurants", "dining", "wedding", "weddings", "venue", "venues", "reception", "receptions",
+    "banquet", "ballroom", "ceremony", "bridal", "meeting", "meetings", "conference", "conferences",
+    "convention", "event", "events", "space", "spaces", "party", "parties", "things", "thing", "do",
+    "see", "visit", "attractions", "activities", "amenities", "amenity"
+}
+
+GEO_DESCRIPTORS = {
+    "downtown", "midtown", "uptown", "old", "town", "historic", "district", "airport",
+    "international", "center", "centre", "central", "square", "park", "beach", "lake", "lakeside",
+    "river", "riverfront", "riverwalk", "waterfront", "oceanfront", "ocean", "bay", "harbor",
+    "island", "mountain", "mountains", "valley", "canyon", "springs", "falls", "coast", "coastal",
+    "north", "south", "east", "west", "metro", "area", "local", "city", "village", "university",
+    "college", "campus", "stadium", "arena", "theater", "theatre", "museum", "zoo", "aquarium",
+    "gardens", "station", "port", "pier", "boardwalk", "strip", "quarter", "landing"
+}
+
+CONNECTORS = {
+    "in", "near", "by", "at", "on", "to", "for", "with", "of", "the", "a", "an", "and", "or",
+    "from", "around", "close", "walking", "distance"
+}
 
 MIN_SEARCH_VOLUME = 30
 MAX_TRACKED_KEYWORDS = 10  # Capped at 10 as requested
@@ -118,36 +201,176 @@ def property_name_from_xlsx(xlsx_path: Path) -> str:
 
 VALUE_RE = r"[+\-]?\d[\d,.]*|-|n/?a"
 
-def is_brand_excluded(keyword: str, property_title: str) -> bool:
-    kw_clean = re.sub(r"[^a-z0-9\s]", "", keyword.lower())
-    prop_clean = re.sub(r"[^a-z0-9\s]", "", property_title.lower())
-    
-    # NEW RULE: Exclude physical addresses completely (e.g. starts with digits, ends with zip code)
-    if re.search(r"\d+\s+[a-z]+\s+[a-z]+.*\b\d{5}\b", kw_clean):
+
+def extract_property_brand_and_locations(
+    property_title: str,
+    tracked: list[dict] | None = None,
+    df_keywords: list[str] | None = None,
+    from_pdf: bool = True,
+) -> tuple[set[str], set[str]]:
+    prop_clean = re.sub(r"[^a-z0-9\s]", " ", property_title.lower())
+    prop_tokens = [w for w in prop_clean.split() if len(w) > 1]
+
+    title_locs: set[str] = set()
+    for loc in KNOWN_LOCATIONS:
+        if re.search(r"\b" + re.escape(loc) + r"\b", prop_clean):
+            for w in loc.split():
+                title_locs.add(w)
+
+    ignore_prop = HOSPITALITY_WORDS | CONNECTORS | GEO_DESCRIPTORS | title_locs
+    prop_brand_words: set[str] = set()
+    for w in prop_tokens:
+        if w not in ignore_prop and len(w) >= 3:
+            prop_brand_words.add(w)
+
+    tracked_locs: set[str] = set()
+    if from_pdf and tracked:
+        for item in tracked:
+            kw_clean = re.sub(r"[^a-z0-9\s]", " ", item["name"].lower())
+            for w in kw_clean.split():
+                if (
+                    w not in HOSPITALITY_WORDS
+                    and w not in CONNECTORS
+                    and w not in GEO_DESCRIPTORS
+                    and w not in prop_brand_words
+                    and len(w) >= 2
+                ):
+                    tracked_locs.add(w)
+
+    inferred_locs: set[str] = set()
+    if df_keywords:
+        loc_counts: dict[str, int] = {}
+        for kw in df_keywords:
+            kw_c = re.sub(r"[^a-z0-9\s]", " ", str(kw).lower())
+            words = kw_c.split()
+            for w in words:
+                if (w in KNOWN_LOCATIONS or w in AIRPORT_CODES) and w not in prop_brand_words:
+                    loc_counts[w] = loc_counts.get(w, 0) + 1
+        for w, cnt in sorted(loc_counts.items(), key=lambda x: -x[1])[:4]:
+            if cnt >= 2:
+                inferred_locs.add(w)
+
+        known_cities = (tracked_locs | title_locs | inferred_locs) - US_STATE_CODES
+        for kw in df_keywords:
+            kw_c = re.sub(r"[^a-z0-9\s]", " ", str(kw).lower())
+            words = kw_c.split()
+            for idx in range(len(words) - 1):
+                if words[idx] in known_cities and words[idx + 1] in US_STATE_CODES:
+                    inferred_locs.add(words[idx + 1])
+
+    target_locations = (tracked_locs | title_locs | inferred_locs) - prop_brand_words - CONNECTORS
+    return prop_brand_words, target_locations
+
+
+def is_brand_excluded(
+    keyword: str,
+    property_title: str,
+    prop_brand_words: set[str] | None = None,
+    target_locations: set[str] | None = None,
+) -> bool:
+    """Return True if the keyword should be EXCLUDED from non-branded location-based Ancillary keywords."""
+    kw_clean = re.sub(r"[^a-z0-9\s]", " ", keyword.lower())
+    kw_clean = re.sub(r"\s+", " ", kw_clean).strip()
+    kw_nospace = re.sub(r"[^a-z0-9]", "", keyword.lower())
+    tokens = kw_clean.split()
+    if not tokens:
         return True
-    
-    # 1. Filter out major chain brands
+
+    if prop_brand_words is None or target_locations is None:
+        prop_brand_words, target_locations = extract_property_brand_and_locations(property_title)
+
+    # 1. Exclude physical street addresses or 5-digit zip codes
+    if (
+        re.search(r"\d+\s+[a-z]+\s+[a-z]+.*\b\d{5}\b", kw_clean)
+        or re.search(r"^\d+\s+[a-z0-9]+\s+(?:st|street|ave|avenue|rd|road|blvd|pl|place|dr|drive|ln|lane|way|pkwy|hwy)\b", kw_clean)
+        or re.search(r"\b\d{5}\b", kw_clean)
+    ):
+        return True
+
+    # 2. Exclude major hotel chain brands, spaceless concatenations, and typos
     for brand in ALL_CHAIN_BRANDS:
-        brand_clean = re.sub(r"[^a-z0-9\s]", "", brand.lower())
+        brand_clean = re.sub(r"[^a-z0-9\s]", " ", brand.lower()).strip()
+        brand_nospace = re.sub(r"[^a-z0-9]", "", brand.lower())
         if re.search(r"\b" + re.escape(brand_clean) + r"\b", kw_clean):
             return True
-            
-    # 2. Filter out the specific property's FULL name identifier (e.g. "teatro" or "morrison house")
-    ignore_words = {"hotel", "resort", "inn", "suites", "spa", "by", "the", "and", "of", "a"}
-    prop_words = [w for w in prop_clean.split() if w not in ignore_words and len(w) > 3]
-    
-    # Check if the keyword contains the unique property identifier
-    for word in prop_words:
-        # DO NOT exclude location names (e.g., 'muscle shoals', 'shoals', 'denver', 'san antonio') 
-        # Check against common generic location terms we want to preserve in ancillary keywords
-        generic_locations = ["shoals", "denver", "san antonio", "orlando", "cary", "boerne", "alexandria", "new orleans", "salt lake city", "fairhope"]
-        if word in generic_locations:
-            continue
-            
-        if re.search(r"\b" + re.escape(word) + r"\b", kw_clean):
+        if len(brand_nospace) >= 5 and brand_nospace in kw_nospace:
             return True
-            
+        if " " not in brand_clean and len(brand_clean) >= 5:
+            for t in tokens:
+                if len(t) >= 4 and SequenceMatcher(None, t, brand_clean).ratio() >= 0.80:
+                    return True
+
+    # 3. Exclude property-specific brand words, spaceless variants (e.g. 'thenines'), and typos (e.g. 'tiatro', 'treato')
+    for bw in prop_brand_words:
+        if re.search(r"\b" + re.escape(bw) + r"\b", kw_clean):
+            return True
+        if len(bw) >= 4 and bw in kw_nospace:
+            return True
+        for t in tokens:
+            if len(t) >= 4 and len(bw) >= 4 and SequenceMatcher(None, t, bw).ratio() >= 0.80:
+                return True
+
+    # 4. Exclude restaurant menus, bars/grills, reviews, photos, room counts, and '+' lounge names
+    bad_terms = {
+        "menu", "menus", "reviews", "review", "photos", "photo", "pictures", "count",
+        "address", "phone", "number", "careers", "jobs", "login", "bar and grill",
+        "bar and grille", "steakhouse",
+    }
+    for bt in bad_terms:
+        if re.search(r"\b" + re.escape(bt) + r"\b", kw_clean):
+            return True
+    if "+" in keyword:
+        return True
+
+    # 5. Require a core hospitality / travel / event intent word
+    core_intent = {
+        "hotel", "hotels", "resort", "resorts", "spa", "spas", "inn", "inns", "suite", "suites",
+        "lodging", "accommodation", "accommodations", "stay", "stays", "motel", "motels",
+        "retreat", "retreats", "getaway", "getaways", "boutique", "wedding", "weddings",
+        "venue", "venues", "meeting", "meetings", "conference", "package", "packages",
+        "deal", "deals", "things", "places", "restaurants",
+    }
+    if not any(t in core_intent for t in tokens):
+        return True
+
+    # Only allow restaurant keywords if paired with hotel(s) or general discovery ('restaurants in/near', 'rooftop restaurants')
+    if ("restaurant" in tokens or "restaurants" in tokens) and not ("hotel" in tokens or "hotels" in tokens):
+        if not re.search(r"\b(?:restaurants\s+(?:in|near)|rooftop\s+restaurants?)\b", kw_clean):
+            return True
+
+    # 6. Must be LOCATION-BASED (contain a target location word for this property, or a 'near <landmark>' phrase)
+    has_target_loc = any(t in target_locations for t in tokens)
+    has_near = "near" in tokens and tokens[-1] != "near" and "near me" not in kw_clean
+    if not (has_target_loc or has_near):
+        return True
+
+    # 7. Reject unknown proper nouns (on-site restaurant client names like 'departure', 'urban farmer', 'nickel',
+    # building/venue names like 'meier & frank', 'fantinos', competitor names, or unrelated cities)
+    allowed_vocab = HOSPITALITY_WORDS | GEO_DESCRIPTORS | CONNECTORS | target_locations
+    check_tokens = tokens[:tokens.index("near")] if has_near else tokens
+    for t in check_tokens:
+        if t not in allowed_vocab:
+            return True
+
     return False
+
+
+def _stem_word(w: str) -> str:
+    if w.endswith("ies") and len(w) > 4:
+        return w[:-3] + "y"
+    if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+        return w[:-1]
+    return w
+
+
+def _keyword_topic_signature(kw: str, target_locs: set[str]) -> tuple:
+    tokens = re.sub(r"[^a-z0-9\s]", " ", kw.lower()).split()
+    if "near" in tokens:
+        near_idx = tokens.index("near")
+        after = [_stem_word(t) for t in tokens[near_idx + 1:] if t not in CONNECTORS and t not in target_locs]
+        return ("near", tuple(sorted(after)) or ("loc",))
+    core = sorted({_stem_word(t) for t in tokens if t not in CONNECTORS and t not in target_locs})
+    return tuple(core)
 
 def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> list[dict]:
     if pymupdf is not None and pdf_path is not None:
@@ -210,7 +433,7 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
     return result[:MAX_TRACKED_KEYWORDS]
 
 
-def tracked_from_xlsx(xlsx_path: Path) -> list[dict]:
+def tracked_from_xlsx(xlsx_path: Path, prop_name: str = "") -> list[dict]:
     frame = pd.read_excel(xlsx_path)
     frame.columns = [str(c).strip() for c in frame.columns]
     keyword_cols = [c for c in frame.columns if any(x in c.lower() for x in ("keyword", "query", "search term"))]
@@ -220,13 +443,28 @@ def tracked_from_xlsx(xlsx_path: Path) -> list[dict]:
     kw_col, pos_col = keyword_cols[0], position_cols[0]
     frame["_kw"] = frame[kw_col].fillna("").astype(str).str.strip()
     frame["_pos"] = pd.to_numeric(frame[pos_col], errors="coerce")
-    frame = frame[(frame["_kw"] != "") & frame["_pos"].notna()].drop_duplicates("_kw").head(MAX_TRACKED_KEYWORDS)
+    frame = frame[(frame["_kw"] != "") & frame["_pos"].notna()].drop_duplicates("_kw")
+    if prop_name:
+        prop_brands, target_locs = extract_property_brand_and_locations(
+            prop_name, None, frame["_kw"].tolist(), from_pdf=False
+        )
+        non_branded = frame[
+            ~frame["_kw"].apply(lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs))
+        ]
+        if not non_branded.empty:
+            frame = non_branded
+    frame = frame.head(MAX_TRACKED_KEYWORDS)
     if frame.empty:
         raise ValueError("No keyword rows with a numeric position were found in the Excel file.")
     return [{"name": row["_kw"], "start": int(row["_pos"]), "pos": int(row["_pos"]), "diff": 0} for _, row in frame.iterrows()]
 
 
-def keyword_rows(xlsx_path: Path, tracked: list[dict], prop_name: str = "") -> tuple[list[dict], str]:
+def keyword_rows(
+    xlsx_path: Path,
+    tracked: list[dict],
+    prop_name: str = "",
+    from_pdf: bool = True,
+) -> tuple[list[dict], str]:
     try:
         frame = pd.read_excel(xlsx_path)
     except Exception as exc:
@@ -260,14 +498,49 @@ def keyword_rows(xlsx_path: Path, tracked: list[dict], prop_name: str = "") -> t
     # Apply minimum search volume
     frame = frame[frame["_volume"] >= MIN_SEARCH_VOLUME]
 
-    # Apply strict brand exclusion rule for Ancillary keywords
-    frame["_is_excluded"] = frame["_keyword"].apply(lambda kw: is_brand_excluded(kw, prop_name))
+    # Extract property brand identifiers and target location terms
+    prop_brands, target_locs = extract_property_brand_and_locations(
+        prop_name, tracked, frame["_keyword"].tolist(), from_pdf=from_pdf
+    )
+
+    # Apply strict brand, client/restaurant name, and location-based filtering for Ancillary keywords
+    frame["_is_excluded"] = frame["_keyword"].apply(
+        lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs)
+    )
     frame = frame[~frame["_is_excluded"]]
 
-    selected = []
+    # Select diverse location-based keywords (capping identical topic stems at 2 so 'near' & diverse terms appear)
+    candidates = []
     for position, group in frame.groupby("_position", sort=True):
-        selected.extend(group.head(4 if position <= 2 else 2).to_dict("records"))
+        candidates.extend(group.head(4 if position <= 2 else 2).to_dict("records"))
+
+    topic_counts: dict[tuple, int] = {}
+    selected = []
+    overflow = []
+    for row in candidates:
+        sig = _keyword_topic_signature(row["_keyword"], target_locs)
+        if topic_counts.get(sig, 0) < 2:
+            topic_counts[sig] = topic_counts.get(sig, 0) + 1
+            selected.append(row)
+        else:
+            overflow.append(row)
+
     selected = selected[:MAX_ANCILLARY_KEYWORDS]
+    if len(selected) < MAX_ANCILLARY_KEYWORDS:
+        selected.extend(overflow[: MAX_ANCILLARY_KEYWORDS - len(selected)])
+
+    # Ensure at least one 'near' location keyword is included when available in the filtered set
+    near_rows = [
+        r for r in frame.to_dict("records")
+        if re.search(r"\bnear\b", r["_keyword"].lower())
+    ]
+    if near_rows and not any(re.search(r"\bnear\b", r["_keyword"].lower()) for r in selected):
+        if len(selected) >= MAX_ANCILLARY_KEYWORDS:
+            selected[-1] = near_rows[0]
+        else:
+            selected.append(near_rows[0])
+
+    selected.sort(key=lambda r: (int(r["_position"]), -int(r["_volume"])))
     rows = [{"keyword": row["_keyword"], "position": int(row["_position"]), "volume": int(row["_volume"])} for row in selected]
     return rows, kw_col
 
@@ -374,8 +647,8 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
             raise ValueError(f"Could not read ranking data from the PDF ({pdf.name}): {exc}. Remove the PDF to use Excel ranking data instead.") from exc
     else:
         name = property_name_from_xlsx(xlsx)
-        tracked = tracked_from_xlsx(xlsx)
-    ancillary, keyword_column = keyword_rows(xlsx, tracked, name)
+        tracked = tracked_from_xlsx(xlsx, name)
+    ancillary, keyword_column = keyword_rows(xlsx, tracked, name, from_pdf=bool(pdf))
 
     prs = Presentation(str(template))
     if len(prs.slides) < 4:

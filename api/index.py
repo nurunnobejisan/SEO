@@ -36,8 +36,11 @@ def _stream_signature(file_storage) -> str:
 
 
 def _cache_key(template, xlsx, pdf=None) -> str:
+    report_script = Path(__file__).resolve().parent / "seo_visibility_report.py"
+    script_hash = hashlib.sha256(report_script.read_bytes()).hexdigest() if report_script.is_file() else "v11"
     payload = "|".join(
         [
+            script_hash,
             _stream_signature(template),
             _stream_signature(xlsx),
             _stream_signature(pdf),
@@ -48,6 +51,9 @@ def _cache_key(template, xlsx, pdf=None) -> str:
 
 @app.route('/')
 def home():
+    root_index = Path(__file__).resolve().parent.parent / 'index.html'
+    if root_index.is_file():
+        return send_file(root_index)
     return send_file('index.html')
 
 
