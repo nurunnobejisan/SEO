@@ -23,27 +23,25 @@ def _download_filename(name: str) -> str:
     return f"seo_visibility_report_{base}.pptx"
 
 
-def _stream_signature(file_storage) -> str:
-    if not file_storage or not getattr(file_storage, "stream", None):
+def _file_signature(path: Path | None) -> str:
+    if not path or not path.is_file():
         return ""
-    stream = file_storage.stream
-    stream.seek(0)
     digest = hashlib.sha256()
-    for chunk in iter(lambda: stream.read(65536), b""):
-        digest.update(chunk)
-    stream.seek(0)
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
-def _cache_key(template, xlsx, pdf=None) -> str:
+def _cache_key(template_path: Path, xlsx_path: Path, pdf_path: Path | None = None) -> str:
     report_script = Path(__file__).resolve().parent / "seo_visibility_report.py"
     script_hash = hashlib.sha256(report_script.read_bytes()).hexdigest() if report_script.is_file() else "v11"
     payload = "|".join(
         [
             script_hash,
-            _stream_signature(template),
-            _stream_signature(xlsx),
-            _stream_signature(pdf),
+            _file_signature(template_path),
+            _file_signature(xlsx_path),
+            _file_signature(pdf_path),
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -86,7 +84,7 @@ def generate_report():
             except Exception:
                 pass
 
-        cache_key = _cache_key(template, xlsx, pdf)
+        cache_key = _cache_key(template_path, xlsx_path, pdf_path)
         cached_path = CACHE_DIR / f"{cache_key}.pptx"
         download_name = _download_filename(name)
 

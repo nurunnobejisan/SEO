@@ -124,7 +124,8 @@ HOSPITALITY_WORDS = {
     "restaurants", "dining", "wedding", "weddings", "venue", "venues", "reception", "receptions",
     "banquet", "ballroom", "ceremony", "bridal", "meeting", "meetings", "conference", "conferences",
     "convention", "event", "events", "space", "spaces", "party", "parties", "things", "thing", "do",
-    "see", "visit", "attractions", "activities", "amenities", "amenity"
+    "see", "visit", "attractions", "activities", "amenities", "amenity", "lodge", "lodges", "villa",
+    "villas", "cottage", "cottages", "cabin", "cabins", "trip", "trips", "travel", "guide"
 }
 
 GEO_DESCRIPTORS = {
@@ -217,6 +218,24 @@ def extract_property_brand_and_locations(
             for w in loc.split():
                 title_locs.add(w)
 
+    # Also detect if any token in property_title is used as a city in 'hotels in <city>' / 'downtown <city>'
+    sample_kws: list[str] = []
+    if from_pdf and tracked:
+        sample_kws.extend(item["name"] for item in tracked)
+    if df_keywords:
+        sample_kws.extend(str(k) for k in df_keywords[:500])
+    if sample_kws:
+        joined_samples = "\n".join(re.sub(r"[^a-z0-9\s]", " ", k.lower()) for k in sample_kws)
+        for w in prop_tokens:
+            if len(w) >= 3 and w not in HOSPITALITY_WORDS and w not in CONNECTORS:
+                if re.search(
+                    r"\b(?:hotels?\s+in|stays?\s+in|places\s+to\s+stay\s+in|things\s+to\s+do\s+in|downtown)\s+"
+                    + re.escape(w)
+                    + r"\b",
+                    joined_samples,
+                ):
+                    title_locs.add(w)
+
     ignore_prop = HOSPITALITY_WORDS | CONNECTORS | GEO_DESCRIPTORS | title_locs
     prop_brand_words: set[str] = set()
     for w in prop_tokens:
@@ -267,6 +286,7 @@ def is_brand_excluded(
     property_title: str,
     prop_brand_words: set[str] | None = None,
     target_locations: set[str] | None = None,
+    strict_vocab: bool = True,
 ) -> bool:
     """Return True if the keyword should be EXCLUDED from non-branded location-based Ancillary keywords."""
     kw_clean = re.sub(r"[^a-z0-9\s]", " ", keyword.lower())
@@ -346,10 +366,19 @@ def is_brand_excluded(
 
     # 7. Reject unknown proper nouns (on-site restaurant client names like 'departure', 'urban farmer', 'nickel',
     # building/venue names like 'meier & frank', 'fantinos', competitor names, or unrelated cities)
-    allowed_vocab = HOSPITALITY_WORDS | GEO_DESCRIPTORS | CONNECTORS | target_locations
-    check_tokens = tokens[:tokens.index("near")] if has_near else tokens
-    for t in check_tokens:
-        if t not in allowed_vocab:
+    if strict_vocab:
+        allowed_vocab = HOSPITALITY_WORDS | GEO_DESCRIPTORS | CONNECTORS | target_locations
+        check_tokens = tokens[:tokens.index("near")] if has_near else tokens
+        for t in check_tokens:
+            if t not in allowed_vocab:
+                return True
+    else:
+        # Tier-2 fallback for local neighborhood modifiers: require both a target location word and a strict lodging/venue word
+        strict_lodging = {
+            "hotel", "hotels", "resort", "resorts", "spa", "spas", "inn", "inns",
+            "suite", "suites", "lodging", "stay", "stays", "boutique", "wedding", "weddings", "venue", "venues",
+        }
+        if not (has_target_loc and any(t in strict_lodging for t in tokens)):
             return True
 
     return False
@@ -384,8 +413,26 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
     section = text.split("Keyword Rankings", 1)[1]
     
     section = re.split(r"\b(Site Audit|Backlinks:?|Organic Research|Traffic Analytics)\b", section, maxsplit=1, flags=re.I)[0]
-    total_match = re.search(r"\d+\s*-\s*\d+\s*\((\d+)\)", section)
+    total_match = (
+        re.search(r"\d+\s*-\s*\d+\s*\((\d+)\)", section)
+        or re.search(r"^\s*\d+\s+\d+\s+(\d+)\b", section)
+        or re.search(r"Keyword\s+Rankings\s+\d+\s+\d+\s+(\d+)\b", section, re.I)
+    )
     expected = int(total_match.group(1)) if total_match else None
+
+    header_noise_re = re.compile(
+        r"^(?:"
+        r"(?:Keyword\s+Rankings\s*)?(?:\d+\s*-\s*\d+\s*\(\d+\)|\d+\s+\d+\s+\d+)?"
+        r"|Keyword(?:\s+SERP\s+Features)?(?:\s+KD%)?"
+        r"|SERP\s+Features(?:\s+KD%)?"
+        r"|(?:Position|Diff|URL|KD%|CPC|Volume)(?:\s+(?:Position|Diff|URL|KD%|CPC|Volume))*"
+        r"|800\s+BOYLSTON\s+STREET.*"
+        r"|WWW\.SEMRUSH\.COM.*"
+        r"|Generated\s+on\s+.*"
+        r"|.*The\s+report\s+data\s+is\s+taken\s+from\s+Semrush.*"
+        r")$",
+        re.I,
+    )
 
     entries: list[dict] = []
     current = None
@@ -397,15 +444,25 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
             entries.append(current)
         elif current is None:
             continue
-        elif re.match(r"^\d+(?:st|nd|rd|th)\s+time$", line, re.I):
-            pass # skip these lines
+        elif re.match(r"^\d+(?:st|nd|rd|th)\s+time$", line, re.I) or header_noise_re.match(line):
+            current["finished_name"] = True
+            continue
         else:
             tokens = line.replace("\x00", "+").split()
             if tokens and all(re.fullmatch(VALUE_RE, t, re.I) for t in tokens):
-                current["values"].extend(tokens)
-                current["finished_name"] = True
+                # Ignore standalone page numbers when values haven't started or are already complete
+                if len(tokens) == 1 and (not current["values"] or len(current["values"]) >= 4):
+                    continue
+                if len(current["values"]) < 6:
+                    current["values"].extend(tokens)
+                    current["finished_name"] = True
             elif not current.get("finished_name"):
-                if not re.search(r"https?://", line) and not re.match(r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d", line, re.I):
+                if (
+                    re.search(r"https?://|www\.|\.com\b|\.org\b|\.net\b|/", line, re.I)
+                    or re.match(r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*\d", line, re.I)
+                ):
+                    current["finished_name"] = True
+                else:
                     current["name_parts"].append(line)
 
     entries = [e for e in entries if len(e["values"]) >= 4]
@@ -503,11 +560,37 @@ def keyword_rows(
         prop_name, tracked, frame["_keyword"].tolist(), from_pdf=from_pdf
     )
 
+    # Optional URL-column check to block dedicated restaurant/bar/menu PDF URLs for non-hotel queries
+    url_cols = [c for c in frame.columns if c.lower() in ("url", "landing page", "page url")]
+    if url_cols:
+        url_col = url_cols[0]
+        frame["_url"] = frame[url_col].fillna("").astype(str).str.lower()
+        frame = frame[
+            ~(
+                frame["_url"].str.contains(r"\.pdf\b|/menu\b|/menus\b", regex=True)
+                | (
+                    frame["_url"].str.contains(r"/dining/|/restaurant/|/restaurants/", regex=True)
+                    & ~frame["_keyword"].str.lower().str.contains(r"\b(?:hotels?|resorts?|spas?)\b", regex=True)
+                )
+            )
+        ]
+
     # Apply strict brand, client/restaurant name, and location-based filtering for Ancillary keywords
-    frame["_is_excluded"] = frame["_keyword"].apply(
-        lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs)
-    )
-    frame = frame[~frame["_is_excluded"]]
+    strict_frame = frame[
+        ~frame["_keyword"].apply(
+            lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs, strict_vocab=True)
+        )
+    ]
+
+    if len(strict_frame) < MAX_ANCILLARY_KEYWORDS:
+        fallback_frame = frame[
+            ~frame["_keyword"].apply(
+                lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs, strict_vocab=False)
+            )
+        ]
+        frame = pd.concat([strict_frame, fallback_frame]).drop_duplicates("_normalized")
+    else:
+        frame = strict_frame
 
     # Select diverse location-based keywords (capping identical topic stems at 2 so 'near' & diverse terms appear)
     candidates = []
@@ -595,9 +678,13 @@ def duplicate_slide(prs: Presentation, source_index: int, insert_index: int):
             new_rId = new_slide.part.rels.get_or_add(rel.reltype, rel.target_part)
         rId_map[rel.rId] = new_rId
 
+    next_shape_id = 100
     for child in list(source_slide.shapes._spTree)[2:]:
         new_el = copy.deepcopy(child)
         for el in new_el.iter():
+            if el.tag.endswith("}cNvPr") and "id" in el.attrib:
+                el.set("id", str(next_shape_id))
+                next_shape_id += 1
             for attr_name, attr_val in list(el.attrib.items()):
                 if attr_val in rId_map:
                     el.set(attr_name, rId_map[attr_val])
