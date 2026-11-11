@@ -5,8 +5,16 @@
       "destination": "/api/index"
     },
     {
-      "source": "/(.*)",
-      "destination": "/index.html"
+      "source": "/generate",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/upload",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/((?!.*\\.(?:html|css|js|png|jpg|ico|svg|json)$).*)",
+      "destination": "/api/index"
     }
   ]
 }
