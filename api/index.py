@@ -18,6 +18,11 @@ CACHE_DIR = Path(tempfile.gettempdir()) / "seo_visibility_report_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _download_filename(name: str) -> str:
+    base = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .") or "Property_Name"
+    return f"seo_visibility_report_{base}.pptx"
+
+
 def _stream_signature(file_storage) -> str:
     if not file_storage or not getattr(file_storage, "stream", None):
         return ""
@@ -59,17 +64,6 @@ def generate_report():
         if not template or not xlsx:
             return jsonify({"error": "PowerPoint template and Excel file are required."}), 400
 
-        cache_key = _cache_key(template, xlsx, pdf)
-        cached_path = CACHE_DIR / f"{cache_key}.pptx"
-
-        if cached_path.exists():
-            return send_file(
-                cached_path,
-                as_attachment=True,
-                download_name=cached_path.name,
-                mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            )
-
         template_path = Path(temp_dir) / template.filename
         xlsx_path = Path(temp_dir) / xlsx.filename
         template.save(template_path)
@@ -86,15 +80,25 @@ def generate_report():
             except Exception:
                 pass
 
-        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .") or "Property_Name"
-        output_path = cached_path
+        cache_key = _cache_key(template, xlsx, pdf)
+        cached_path = CACHE_DIR / f"{cache_key}.pptx"
+        download_name = _download_filename(name)
 
+        if cached_path.exists():
+            return send_file(
+                cached_path,
+                as_attachment=True,
+                download_name=download_name,
+                mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+
+        output_path = cached_path
         build(template_path, pdf_path, xlsx_path, output_path, full_list_url="")
 
         response = send_file(
             output_path,
             as_attachment=True,
-            download_name=output_path.name,
+            download_name=download_name,
             mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         )
         response.headers["X-Accel-Buffering"] = "no"
