@@ -430,7 +430,7 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
     if not result:
         raise ValueError("Could not read keyword rows from the PDF. No fallback keyword data was inserted.")
     
-    return result[:MAX_TRACKED_KEYWORDS]
+    return result
 
 
 def tracked_from_xlsx(xlsx_path: Path, prop_name: str = "") -> list[dict]:
@@ -576,6 +576,57 @@ def resize_table(table, data_rows: int) -> None:
         tbl.remove(tbl.tr_lst[-1])
 
 
+def duplicate_slide(prs: Presentation, source_index: int, insert_index: int):
+    """Clone prs.slides[source_index] and insert the new slide at insert_index."""
+    source_slide = prs.slides[source_index]
+    new_slide = prs.slides.add_slide(source_slide.slide_layout)
+
+    sp_tree = new_slide.shapes._spTree
+    for child in list(sp_tree)[2:]:
+        sp_tree.remove(child)
+
+    rId_map = {}
+    for rel in source_slide.part.rels.values():
+        if "slideLayout" in rel.reltype or "notesSlide" in rel.reltype:
+            continue
+        if rel.is_external:
+            new_rId = new_slide.part.rels.get_or_add_ext_rel(rel.reltype, rel.target_ref)
+        else:
+            new_rId = new_slide.part.rels.get_or_add(rel.reltype, rel.target_part)
+        rId_map[rel.rId] = new_rId
+
+    for child in list(source_slide.shapes._spTree)[2:]:
+        new_el = copy.deepcopy(child)
+        for el in new_el.iter():
+            for attr_name, attr_val in list(el.attrib.items()):
+                if attr_val in rId_map:
+                    el.set(attr_name, rId_map[attr_val])
+        sp_tree.append(new_el)
+
+    sldIdLst = prs.slides._sldIdLst
+    new_sldId = sldIdLst[-1]
+    sldIdLst.remove(new_sldId)
+    sldIdLst.insert(insert_index, new_sldId)
+    return prs.slides[insert_index]
+
+
+def populate_tracked_table(table, items: list[dict], start_number: int = 1) -> None:
+    resize_table(table, len(items))
+    for i, item in enumerate(items, 1):
+        kw_label = f"{start_number + i - 1}. {item['name']}"
+        if item["pos"] is None and item["diff"] is None:
+            values = [kw_label, "N/A", "N/A", "N/A"]
+        elif item["pos"] is None and item["diff"] is not None:
+            start_val = item["start"] if item["start"] is not None else "N/A"
+            values = [kw_label, start_val, "N/A", f'{item["diff"]:+d}']
+        else:
+            start_val = item["start"] if item["start"] is not None else (item["pos"] + item["diff"])
+            diff_str = "Flat" if item["diff"] == 0 else f'{item["diff"]:+d}'
+            values = [kw_label, start_val, item["pos"], diff_str]
+        for j, value in enumerate(values):
+            set_cell(table.cell(i, j), value, is_keyword=True)
+
+
 def set_paragraph_text(paragraph, value: str) -> None:
     if paragraph.runs:
         paragraph.runs[0].text = value
@@ -664,27 +715,25 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
 
     try:
         slide2_table = next(shape.table for shape in prs.slides[1].shapes if shape.has_table)
-        slide3_table = next(shape.table for shape in prs.slides[2].shapes if shape.has_table)
+        ancillary_table = next(shape.table for shape in prs.slides[2].shapes if shape.has_table)
     except StopIteration as exc:
         raise ValueError("Template is missing the expected table on slide 2 or slide 3.") from exc
-    if len(slide2_table.columns) < 4 or len(slide3_table.columns) < 3:
+    if len(slide2_table.columns) < 4 or len(ancillary_table.columns) < 3:
         raise ValueError("Template table columns do not match the expected report layout.")
 
-    resize_table(slide2_table, len(tracked))
-    for i, item in enumerate(tracked, 1):
-        kw_label = f"{i}. {item['name']}"
-        if item["pos"] is None and item["diff"] is None:
-            values = [kw_label, "N/A", "N/A", "N/A"]
-        elif item["pos"] is None and item["diff"] is not None:
-            start_val = item["start"] if item["start"] is not None else "N/A"
-            values = [kw_label, start_val, "N/A", f'{item["diff"]:+d}']
-        else:
-            start_val = item["start"] if item["start"] is not None else (item["pos"] + item["diff"])
-            diff_str = "Flat" if item["diff"] == 0 else f'{item["diff"]:+d}'
-            values = [kw_label, start_val, item["pos"], diff_str]
-        for j, value in enumerate(values):
-            set_cell(slide2_table.cell(i, j), value, is_keyword=True)
+    # Remove slide 5 (SEO Errors Report) from template before inserting any overflow slides
+    if len(prs.slides) > 4:
+        fifth = prs.slides[4]
+        full_slide5_text = " ".join(s.text for s in fifth.shapes if s.has_text_frame).lower()
+        if "[seo team to insert" in full_slide5_text or "seo errors" in full_slide5_text:
+            ids = prs.slides._sldIdLst
+            sid = list(ids)[4]
+            prs.part.drop_rel(sid.rId)
+            ids.remove(sid)
 
+    benefits_slide = prs.slides[3]
+
+    # Update Insights on Slide 2 before duplicating for overflow slides
     updated_insight = insights(tracked)
     insight_found = False
     for shape in prs.slides[1].shapes:
@@ -712,12 +761,27 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
     if not insight_found:
         print("Warning: no Insights text box found on slide 2; rankings were added to the table.", file=sys.stderr)
 
-    resize_table(slide3_table, len(ancillary))
+    # Paginate tracked keywords across Slide 2 (and Slide 3+ if len(tracked) > 10)
+    tracked_chunks = [
+        tracked[idx : idx + MAX_TRACKED_KEYWORDS]
+        for idx in range(0, len(tracked), MAX_TRACKED_KEYWORDS)
+    ] or [[]]
+
+    for page_idx, chunk in enumerate(tracked_chunks):
+        start_num = page_idx * MAX_TRACKED_KEYWORDS + 1
+        if page_idx == 0:
+            populate_tracked_table(slide2_table, chunk, start_number=start_num)
+        else:
+            overflow_slide = duplicate_slide(prs, 1, 1 + page_idx)
+            overflow_table = next(shape.table for shape in overflow_slide.shapes if shape.has_table)
+            populate_tracked_table(overflow_table, chunk, start_number=start_num)
+
+    resize_table(ancillary_table, len(ancillary))
     for i, row in enumerate(ancillary, 1):
         for j, value in enumerate((row["keyword"], row["position"], row["volume"])):
-            set_cell(slide3_table.cell(i, j), value, is_keyword=True)
+            set_cell(ancillary_table.cell(i, j), value, is_keyword=True)
 
-    for shape in prs.slides[3].shapes:
+    for shape in benefits_slide.shapes:
         if shape.has_text_frame:
             for paragraph in shape.text_frame.paragraphs:
                 for run in list(paragraph.runs):
@@ -725,15 +789,6 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
                         run._r.getparent().remove(run._r)
                     elif run.text.strip().startswith("Full Keyword") and full_list_url:
                         run.hyperlink.address = full_list_url
-
-    if len(prs.slides) > 4:
-        fifth = prs.slides[4]
-        full_slide5_text = " ".join(s.text for s in fifth.shapes if s.has_text_frame).lower()
-        if "[seo team to insert" in full_slide5_text or "seo errors" in full_slide5_text:
-            ids = prs.slides._sldIdLst
-            sid = list(ids)[4]
-            prs.part.drop_rel(sid.rId)
-            ids.remove(sid)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(output))
