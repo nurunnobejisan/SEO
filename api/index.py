@@ -4,7 +4,10 @@ import re
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 
-from seo_visibility_report import build, property_name, property_name_from_xlsx
+try:
+    from .seo_visibility_report import build, property_name, property_name_from_xlsx
+except ImportError:
+    from seo_visibility_report import build, property_name, property_name_from_xlsx
 from pypdf import PdfReader
 
 app = Flask(__name__)
