@@ -181,7 +181,16 @@ def clean_text(value: str | None) -> str:
 
 
 def property_name(reader: PdfReader, pdf_path: Path) -> str:
-    first = clean_text(reader.pages[0].extract_text()) if reader.pages else ""
+    first = ""
+    if pymupdf is not None and pdf_path is not None:
+        try:
+            doc = pymupdf.open(str(pdf_path))
+            if len(doc) > 0:
+                first = clean_text(doc[0].get_text())
+        except Exception:
+            pass
+    if not first and reader.pages:
+        first = clean_text(reader.pages[0].extract_text())
     match = re.search(r"\bFor\s+(.+?)(?=\s+(?:Domain|Date|Device|Database|Generated\s+on|Report\s+Date)\b|$)", first, re.I)
     if match:
         name = clean_text(match.group(1)).strip(" _-:")
@@ -415,18 +424,19 @@ def _decode_semrush_pua(text: str) -> str:
     return "".join(out)
 
 
-def _extract_pdf_pages(reader: PdfReader, pdf_path: Path | None = None) -> list[str]:
-    """Extract text per page using pypdf first (consistent across macOS & Vercel), falling back to pymupdf."""
-    pages = [_decode_semrush_pua(p.extract_text() or "") for p in reader.pages]
-    if any(p.strip() for p in pages):
-        return pages
-    if pymupdf is not None and pdf_path is not None:
-        return [_decode_semrush_pua(page.get_text() or "") for page in pymupdf.open(str(pdf_path))]
-    return pages
+def _extract_pdf_pages(reader: PdfReader, pdf_path: Path | None = None, prefer_pymupdf: bool = True) -> list[str]:
+    """Extract text per page using pymupdf first (preferred for Semrush tables), falling back to pypdf."""
+    if prefer_pymupdf and pymupdf is not None and pdf_path is not None:
+        try:
+            pages = [_decode_semrush_pua(page.get_text() or "") for page in pymupdf.open(str(pdf_path))]
+            if any(p.strip() for p in pages):
+                return pages
+        except Exception:
+            pass
+    return [_decode_semrush_pua(p.extract_text() or "") for p in reader.pages]
 
 
-def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> list[dict]:
-    pages = _extract_pdf_pages(reader, pdf_path)
+def _parse_tracked_from_pages(pages: list[str]) -> list[dict]:
     start = next((i for i, text in enumerate(pages) if "Keyword Rankings" in text), None)
     if start is None:
         raise ValueError("The PDF has no 'Keyword Rankings' section. Check that this is the expected Semrush report.")
@@ -453,8 +463,9 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
     header_noise_re = re.compile(
         r"^(?:"
         r"(?:Keyword\s+Rankings\s*)?(?:\d+\s*-\s*\d+\s*\(\d+\)|\d+\s+\d+\s+\d+)?"
-        r"|Keyword(?:\s+SERP\s+Features)?(?:\s+KD%)?"
-        r"|SERP\s+Features(?:\s+KD%)?"
+        r"|Keyword(?:\s+SERP\s+Features)?(?:\s+KD%?)?"
+        r"|SERP\s+Features(?:\s+KD%?)?"
+        r"|KD|%?"
         r"|(?:Position|Diff|URL|KD%|CPC|Volume)(?:\s+(?:Position|Diff|URL|KD%|CPC|Volume))*"
         r")$",
         re.I,
@@ -523,9 +534,17 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
                 start_pos = 100 + diff
         if name:
             result.append({"name": name, "start": start_pos, "pos": pos, "diff": diff})
+    return result
+
+
+def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> list[dict]:
+    pages = _extract_pdf_pages(reader, pdf_path, prefer_pymupdf=True)
+    result = _parse_tracked_from_pages(pages)
+    if not result and pymupdf is not None and pdf_path is not None:
+        fallback_pages = _extract_pdf_pages(reader, pdf_path, prefer_pymupdf=False)
+        result = _parse_tracked_from_pages(fallback_pages)
     if not result:
         raise ValueError("Could not read keyword rows from the PDF. No fallback keyword data was inserted.")
-    
     return result
 
 
@@ -1154,18 +1173,28 @@ def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: s
 
 def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_url: str = "") -> None:
     audit_data = None
+    used_pdf_tracked = False
     if pdf:
+        reader = PdfReader(str(pdf))
         try:
-            reader = PdfReader(str(pdf))
             name = property_name(reader, pdf)
+        except Exception:
+            name = property_name_from_xlsx(xlsx)
+        try:
             tracked = parse_tracked_keywords(reader, pdf)
+            used_pdf_tracked = True
+        except Exception as exc:
+            print(f"Warning: PDF keyword parsing failed ({exc}); falling back to Excel.", file=sys.stderr)
+            tracked = tracked_from_xlsx(xlsx, name)
+        try:
             audit_data = parse_site_audit(reader, pdf)
         except Exception as exc:
-            raise ValueError(f"Could not read ranking data from the PDF ({pdf.name}): {exc}. Remove the PDF to use Excel ranking data instead.") from exc
+            print(f"Warning: PDF Site Audit parsing failed ({exc}).", file=sys.stderr)
+            audit_data = None
     else:
         name = property_name_from_xlsx(xlsx)
         tracked = tracked_from_xlsx(xlsx, name)
-    ancillary, keyword_column = keyword_rows(xlsx, tracked, name, from_pdf=bool(pdf))
+    ancillary, keyword_column = keyword_rows(xlsx, tracked, name, from_pdf=used_pdf_tracked)
 
     prs = Presentation(str(template))
     if len(prs.slides) < 4:
