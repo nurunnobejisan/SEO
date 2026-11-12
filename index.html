@@ -33,6 +33,7 @@
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
@@ -101,19 +102,86 @@
             useEffect(() => { lucide.createIcons(); });
             const readyCount = (template ? 1 : 0) + (xlsx ? 1 : 0);
 
+            const slimWorkbookIfNeeded = async (file) => {
+                if (!file || typeof XLSX === "undefined") return { slimFile: file, keywords: [], urls: [] };
+                try {
+                    const buf = await file.arrayBuffer();
+                    const wb = XLSX.read(buf, { type: "array" });
+                    const sheetName = wb.SheetNames[0];
+                    const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
+                    if (!rows || rows.length === 0) return { slimFile: file, keywords: [], urls: [] };
+
+                    const cols = Object.keys(rows[0]);
+                    const kwCol = cols.find(c => /keyword|query|search term/i.test(c)) || cols[0];
+                    const posCol = cols.find(c => /position|rank/i.test(c)) || cols[1];
+                    const volCol = cols.find(c => /volume|searches/i.test(c)) || cols[2];
+                    const urlCol = cols.find(c => /^(url|landing page|page url)$/i.test(c.trim()));
+
+                    const keywords = [];
+                    const urls = [];
+                    const slimRows = [];
+                    for (const r of rows) {
+                        const kw = String(r[kwCol] || "").trim();
+                        if (!kw) continue;
+                        keywords.push(kw);
+                        const u = urlCol ? String(r[urlCol] || "").trim() : "";
+                        if (u && urls.length < 250) urls.push(u);
+                        const rowObj = { Keyword: kw, Position: r[posCol], "Search Volume": volCol ? r[volCol] : 0 };
+                        if (urlCol) rowObj.URL = u;
+                        slimRows.push(rowObj);
+                    }
+
+                    // If file is over 1.8 MB, build a compact .xlsx with only the required columns so serverless payload stays small
+                    if (file.size > 1800000) {
+                        const newWb = XLSX.utils.book_new();
+                        const newWs = XLSX.utils.json_to_sheet(slimRows);
+                        XLSX.utils.book_append_sheet(newWb, newWs, "Keywords");
+                        const outArray = XLSX.write(newWb, { bookType: "xlsx", type: "array", compression: true });
+                        const slimBlob = new Blob([outArray], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+                        const slimFile = new File([slimBlob], file.name, { type: slimBlob.type });
+                        return { slimFile, keywords, urls };
+                    }
+                    return { slimFile: file, keywords, urls };
+                } catch (e) {
+                    console.warn("Workbook client parse fallback:", e);
+                    return { slimFile: file, keywords: [], urls: [] };
+                }
+            };
+
+            const parseJsonResponse = async (response, fallbackMsg) => {
+                const rawText = await response.text();
+                let data = null;
+                try {
+                    data = JSON.parse(rawText);
+                } catch (e) {
+                    if (/Request Entity Too Large/i.test(rawText) || response.status === 413) {
+                        throw new Error("The uploaded files exceeded the server request size limit. Please try again.");
+                    }
+                    throw new Error(rawText.slice(0, 180) || fallbackMsg);
+                }
+                if (!response.ok) throw new Error(data.error || fallbackMsg);
+                return data;
+            };
+
             const handleCrawl = async () => {
                 if (!targetUrl.trim() && !xlsx) {
                     setError("Please enter a Target Website URL or upload the Keywords Workbook (.xlsx) first.");
                     return;
                 }
                 setError(""); setCrawlLoading(true);
-                const formData = new FormData();
-                if (targetUrl.trim()) formData.append("target_url", targetUrl.trim());
-                if (xlsx) formData.append("xlsx", xlsx);
                 try {
-                    const response = await fetch("/crawl", { method: "POST", body: formData });
-                    const data = await response.json();
-                    if (!response.ok) throw new Error(data.error || "Failed to crawl target website.");
+                    const { keywords, urls } = xlsx ? await slimWorkbookIfNeeded(xlsx) : { keywords: [], urls: [] };
+                    const response = await fetch("/crawl", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            target_url: targetUrl.trim(),
+                            workbook_keywords: keywords,
+                            workbook_urls: urls,
+                            property_title: xlsx ? xlsx.name.replace(/\.xlsx$/i, "") : "",
+                        }),
+                    });
+                    const data = await parseJsonResponse(response, "Failed to crawl target website.");
                     setCrawlResult(data);
                     if (!targetUrl.trim() && data.target_url) setTargetUrl(data.target_url);
                 } catch (err) {
@@ -129,19 +197,18 @@
                     setSuccessMsg(""); return;
                 }
                 setError(""); setSuccessMsg(""); setLoading(true);
-                const formData = new FormData();
-                formData.append("template", template); formData.append("xlsx", xlsx);
-                if (pdf) formData.append("pdf", pdf);
-                if (targetUrl.trim()) formData.append("target_url", targetUrl.trim());
-
                 try {
+                    const { slimFile } = await slimWorkbookIfNeeded(xlsx);
+                    const formData = new FormData();
+                    formData.append("template", template);
+                    formData.append("xlsx", slimFile);
+                    if (pdf) formData.append("pdf", pdf);
+                    if (targetUrl.trim()) formData.append("target_url", targetUrl.trim());
+
                     const response = await fetch(API_ENDPOINT, { method: "POST", body: formData });
                     
                     if (!response.ok) {
-                        const errorText = await response.text();
-                        let errorMsg = "Failed to generate presentation.";
-                        try { errorMsg = JSON.parse(errorText).error || errorMsg; } catch (e) { errorMsg = errorText || errorMsg; }
-                        throw new Error(errorMsg);
+                        await parseJsonResponse(response, "Failed to generate presentation.");
                     }
 
                     const blob = await response.blob();
@@ -235,7 +302,9 @@
                                                 Target: {crawlResult.page_title}
                                             </span>
                                             <span className="text-[11px] font-medium text-slate-500">
-                                                {crawlResult.crawled_pages > 0 ? `${crawlResult.crawled_pages} page(s) crawled` : 'URL & Workbook profile analyzed'}
+                                                {crawlResult.crawled_pages > 0
+                                                    ? `${crawlResult.crawled_pages} page(s) crawled${crawlResult.sitemap_urls ? ` • ${crawlResult.sitemap_urls} sitemap URLs scanned` : ''}`
+                                                    : 'URL & Workbook profile analyzed'}
                                             </span>
                                         </div>
                                         <div>

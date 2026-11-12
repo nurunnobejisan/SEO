@@ -15,6 +15,7 @@ Trained on historical Cogwheel Marketing / Analytics reports:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import io
 import re
@@ -295,89 +296,181 @@ def _html_to_crawl_text(html: str) -> tuple[str, str]:
     return title, " ".join([title] + meta_parts + [visible])
 
 
+def _discover_sitemap_urls(base_url: str, timeout: float = 3.5) -> list[str]:
+    """Discover all internal page URLs from robots.txt and XML sitemaps (including sitemap indexes)."""
+    parsed = urllib.parse.urlparse(base_url)
+    if not parsed.scheme or not parsed.netloc:
+        return []
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    sitemap_candidates: list[str] = []
+
+    try:
+        robots_txt, _ = _fetch_html(f"{origin}/robots.txt", timeout=2.5)
+        for m in re.findall(r"(?i)^sitemap:\s*(\S+)", robots_txt, re.M):
+            sm_u = m.strip()
+            if sm_u not in sitemap_candidates:
+                sitemap_candidates.append(sm_u)
+    except Exception:
+        pass
+
+    for default_sm in (f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml"):
+        if default_sm not in sitemap_candidates:
+            sitemap_candidates.append(default_sm)
+
+    discovered_pages: list[str] = []
+    child_sitemaps: list[str] = []
+
+    for sm_url in sitemap_candidates[:2]:
+        try:
+            xml_txt, _ = _fetch_html(sm_url, timeout=timeout)
+            locs = [u.strip() for u in re.findall(r"<loc>(.*?)</loc>", xml_txt, re.I | re.S) if u.strip()]
+            if "<sitemapindex" in xml_txt.lower():
+                for loc in locs:
+                    if loc not in child_sitemaps:
+                        child_sitemaps.append(loc)
+            else:
+                for loc in locs:
+                    if loc not in discovered_pages:
+                        discovered_pages.append(loc)
+            if locs:
+                break
+        except Exception:
+            pass
+
+    if child_sitemaps:
+        def _fetch_child(c_url: str) -> list[str]:
+            try:
+                c_xml, _ = _fetch_html(c_url, timeout=timeout)
+                return [u.strip() for u in re.findall(r"<loc>(.*?)</loc>", c_xml, re.I | re.S) if u.strip()]
+            except Exception:
+                return []
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for page_locs in pool.map(_fetch_child, child_sitemaps[:8]):
+                for loc in page_locs:
+                    if loc not in discovered_pages:
+                        discovered_pages.append(loc)
+
+    return discovered_pages
+
+
 def crawl_target_website(
     target_url: str,
     fallback_text: str = "",
     workbook_urls: list[str] | None = None,
     workbook_keywords: list[str] | None = None,
 ) -> dict:
-    """Crawl the target hotel website (and key service subpages) to identify supported services."""
+    """Crawl the target hotel website across sitemaps, navigation links, and service subpages."""
     url = (target_url or "").strip()
     if url and not re.match(r"^https?://", url, re.I):
         url = "https://" + url
 
     crawled_pages = 0
+    sitemap_url_count = 0
     page_title = ""
-    collected_chunks: list[str] = []
+    url_slug_chunks: list[str] = []
+    body_chunks: list[str] = []
+
+    service_slug_re = re.compile(
+        r"(?:amenit|spa|dining|restaurant|meeting|wedding|event|gather|venue|room|suite|pool|accommodat|overview|experience|offer|package|pet|family|golf|casino|resort|boutique)",
+        re.I,
+    )
 
     if url:
-        # Always include the URL path slugs themselves (e.g., 'renaissance-shoals-resort-and-spa')
         parsed = urllib.parse.urlparse(url)
         slug_text = re.sub(r"[^a-z0-9]+", " ", parsed.path.lower())
-        collected_chunks.append(slug_text)
+        url_slug_chunks.append(slug_text)
 
+        # 1. Discover full website structure via XML sitemaps + robots.txt
+        sitemap_urls = _discover_sitemap_urls(url)
+        sitemap_url_count = len(sitemap_urls)
+        for sm_u in sitemap_urls:
+            try:
+                sm_path = urllib.parse.urlparse(sm_u).path.lower()
+                url_slug_chunks.append(re.sub(r"[^a-z0-9]+", " ", sm_path))
+            except Exception:
+                pass
+
+        # 2. Fetch homepage and discover all internal navigation links
+        sub_candidates: list[str] = []
         try:
             html, final_url = _fetch_html(url, timeout=5.0)
             if "access denied" not in html.lower()[:600]:
                 t, txt = _html_to_crawl_text(html)
                 page_title = t
-                collected_chunks.append(txt)
+                body_chunks.append(txt)
                 crawled_pages += 1
 
-                # Discover up to 3 internal service links on the same domain
-                base_netloc = urllib.parse.urlparse(final_url).netloc.lower()
+                base_netloc = urllib.parse.urlparse(final_url).netloc.lower().lstrip("www.")
                 hrefs = re.findall(r'href=["\']([^"\'#]+)["\']', html, re.I)
-                sub_candidates: list[str] = []
-                service_slug_re = re.compile(
-                    r"(?:amenit|spa|dining|restaurant|meeting|wedding|event|room|suite|pool|accommodat|overview|experience)",
-                    re.I,
-                )
-                for h in hrefs:
+                for h in hrefs + sitemap_urls:
                     full_u = urllib.parse.urljoin(final_url, h).split("?")[0].rstrip("/")
                     u_parsed = urllib.parse.urlparse(full_u)
+                    u_netloc = u_parsed.netloc.lower().lstrip("www.")
                     if (
                         u_parsed.scheme in ("http", "https")
-                        and u_parsed.netloc.lower() == base_netloc
+                        and u_netloc == base_netloc
                         and full_u != final_url.rstrip("/")
-                        and service_slug_re.search(u_parsed.path)
-                        and not re.search(r"\.(?:pdf|jpg|jpeg|png|gif|webp|css|js)$", u_parsed.path, re.I)
-                        and full_u not in sub_candidates
+                        and not re.search(r"\.(?:pdf|jpg|jpeg|png|gif|webp|svg|css|js|xml|zip)$", u_parsed.path, re.I)
                     ):
-                        sub_candidates.append(full_u)
-                        collected_chunks.append(re.sub(r"[^a-z0-9]+", " ", u_parsed.path.lower()))
-
-                for sub_url in sub_candidates[:3]:
-                    try:
-                        sub_html, _ = _fetch_html(sub_url, timeout=3.5)
-                        if "access denied" not in sub_html.lower()[:600]:
-                            _, sub_txt = _html_to_crawl_text(sub_html)
-                            collected_chunks.append(sub_txt)
-                            crawled_pages += 1
-                    except Exception:
-                        pass
+                        url_slug_chunks.append(re.sub(r"[^a-z0-9]+", " ", u_parsed.path.lower()))
+                        if service_slug_re.search(u_parsed.path) and full_u not in sub_candidates:
+                            sub_candidates.append(full_u)
         except Exception:
-            pass
+            for sm_u in sitemap_urls:
+                if service_slug_re.search(sm_u) and sm_u not in sub_candidates:
+                    sub_candidates.append(sm_u)
+
+        # 3. Crawl up to 12 key service pages concurrently for deep content verification
+        if sub_candidates:
+            def _fetch_subpage(sub_u: str) -> tuple[str, str] | None:
+                try:
+                    sub_html, _ = _fetch_html(sub_u, timeout=3.5)
+                    if "access denied" not in sub_html.lower()[:600]:
+                        return _html_to_crawl_text(sub_html)
+                except Exception:
+                    pass
+                return None
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for res in pool.map(_fetch_subpage, sub_candidates[:12]):
+                    if res is not None:
+                        sub_t, sub_txt = res
+                        if not page_title and sub_t:
+                            page_title = sub_t
+                        body_chunks.append(sub_txt)
+                        crawled_pages += 1
 
     if workbook_urls:
-        for wu in workbook_urls[:100]:
+        for wu in workbook_urls[:300]:
             try:
                 p_path = urllib.parse.urlparse(wu).path.lower()
-                collected_chunks.append(re.sub(r"[^a-z0-9]+", " ", p_path))
+                url_slug_chunks.append(re.sub(r"[^a-z0-9]+", " ", p_path))
             except Exception:
                 pass
 
     if fallback_text:
-        collected_chunks.append(fallback_text)
+        url_slug_chunks.append(fallback_text)
+    if page_title:
+        url_slug_chunks.append(page_title)
 
-    combined = "\n".join(collected_chunks)
-    website_services = detect_services_in_text(combined)
-    if url or combined.strip():
+    slug_combined = "\n".join(url_slug_chunks)
+    body_combined = "\n".join(body_chunks)
+
+    # Structural property types (spa, pool, resort, casino, golf, ski, all_inclusive, boutique, hot_tub)
+    # must appear in the property title, URL paths, or sitemap/navigation structure (not incidental blog prose)
+    structural_only = {"spa", "pool", "resort", "casino", "golf", "ski", "all_inclusive", "boutique", "hot_tub"}
+    slug_services = detect_services_in_text(slug_combined)
+    body_services = detect_services_in_text(body_combined)
+    website_services = slug_services | (body_services - structural_only)
+    if url or slug_combined.strip() or body_combined.strip():
         website_services.add("lodging")
 
     return {
         "target_url": url,
         "page_title": page_title,
         "crawled_pages": crawled_pages,
+        "sitemap_urls": sitemap_url_count,
         "services": website_services,
     }
 
@@ -467,8 +560,21 @@ def property_name(reader: PdfReader, pdf_path: Path) -> str:
 def property_name_from_xlsx(xlsx_path: Path) -> str:
     name = re.sub(r"\s*\([^)]*\)(?=\.xlsx$)", "", xlsx_path.name, flags=re.I)
     name = re.sub(r"\.xlsx$", "", name, flags=re.I)
-    name = re.sub(r"\s*[-_ ]+(?:ranking\s+)?keywords?\s*$", "", name, flags=re.I)
+    name = re.sub(r"\s*[-_ ]+(?:ranking\s+|keyword\s+)?(?:keywords?|list)\s*$", "", name, flags=re.I)
     name = re.sub(r"\s+", " ", name.replace("_", " ")).strip(" -_")
+    if re.match(r"^(?:organic[\s_-]*positions|referring[\s_-]*domains|backlinks|site[\s_-]*audit)", name, re.I):
+        try:
+            frame = pd.read_excel(xlsx_path, nrows=50)
+            url_cols = [c for c in frame.columns if str(c).strip().lower() in ("url", "landing page", "page url")]
+            if url_cols:
+                urls = [str(u) for u in frame[url_cols[0]].dropna() if str(u).startswith("http")]
+                if urls:
+                    netloc = urllib.parse.urlparse(urls[0]).netloc.lower().lstrip("www.")
+                    slug = netloc.split(".")[0]
+                    if slug and slug not in ("marriott", "hilton", "hyatt", "ihg", "wyndham", "accor"):
+                        return slug.replace("-", " ").title()
+        except Exception:
+            pass
     return name or "SEO Report"
 
 
@@ -480,9 +586,23 @@ def extract_property_brand_and_locations(
     tracked: list[dict] | None = None,
     df_keywords: list[str] | None = None,
     from_pdf: bool = True,
+    target_url: str = "",
 ) -> tuple[set[str], set[str]]:
     prop_clean = re.sub(r"[^a-z0-9\s]", " ", property_title.lower())
     prop_tokens = [w for w in prop_clean.split() if len(w) > 1]
+    if target_url:
+        try:
+            u_parsed = urllib.parse.urlparse(target_url if "://" in target_url else f"https://{target_url}")
+            host_slug = u_parsed.netloc.lower().lstrip("www.").split(".")[0]
+            if host_slug and len(host_slug) >= 4:
+                prop_tokens.append(host_slug)
+                if host_slug.startswith("the") and len(host_slug) >= 7:
+                    prop_tokens.append(host_slug[3:])
+            for seg in re.split(r"[^a-z0-9]+", u_parsed.path.lower()):
+                if len(seg) >= 3:
+                    prop_tokens.append(seg)
+        except Exception:
+            pass
 
     title_locs: set[str] = set()
     for loc in KNOWN_LOCATIONS:
@@ -501,7 +621,7 @@ def extract_property_brand_and_locations(
         for w in prop_tokens:
             if len(w) >= 3 and w not in HOSPITALITY_WORDS and w not in CONNECTORS:
                 if re.search(
-                    r"\b(?:hotels?\s+in|stays?\s+in|places\s+to\s+stay\s+in|things\s+to\s+do\s+in|downtown)\s+"
+                    r"\b(?:hotels?\s+in|stays?\s+in|places\s+to\s+stay\s+in|things\s+to\s+do\s+in)\s+"
                     + re.escape(w)
                     + r"\b",
                     joined_samples,
@@ -513,6 +633,8 @@ def extract_property_brand_and_locations(
     for w in prop_tokens:
         if w not in ignore_prop and len(w) >= 3:
             prop_brand_words.add(w)
+            if w.endswith("s") and len(w) >= 5:
+                prop_brand_words.add(w[:-1])
 
     tracked_locs: set[str] = set()
     if from_pdf and tracked:
@@ -823,6 +945,8 @@ def tracked_from_xlsx(
     frame["_kw"] = frame[kw_col].fillna("").astype(str).str.strip()
     frame["_pos"] = pd.to_numeric(frame[pos_col], errors="coerce")
     frame = frame[(frame["_kw"] != "") & frame["_pos"].notna()].drop_duplicates("_kw")
+    if len(frame) > 500:
+        frame = frame.head(500)
     if prop_name:
         prop_brands, target_locs = extract_property_brand_and_locations(
             prop_name, None, frame["_kw"].tolist(), from_pdf=False
@@ -850,6 +974,7 @@ def keyword_rows(
     prop_name: str = "",
     from_pdf: bool = True,
     allowed_services: set[str] | None = None,
+    target_url: str = "",
 ) -> tuple[list[dict], str]:
     try:
         frame = pd.read_excel(xlsx_path)
@@ -881,12 +1006,14 @@ def keyword_rows(
     tracked_names = {item["name"].casefold() for item in tracked}
     frame = frame[~frame["_normalized"].isin(tracked_names)]
     
-    # Apply minimum search volume
-    frame = frame[frame["_volume"] >= MIN_SEARCH_VOLUME]
+    # Apply minimum search volume and realistic SERP ranking bound (top 50) before heavy string matching
+    frame = frame[(frame["_volume"] >= MIN_SEARCH_VOLUME) & (frame["_position"] <= 50)]
+    if len(frame) > 1500:
+        frame = frame.head(1500)
 
     # Extract property brand identifiers and target location terms
     prop_brands, target_locs = extract_property_brand_and_locations(
-        prop_name, tracked, frame["_keyword"].tolist(), from_pdf=from_pdf
+        prop_name, tracked, frame["_keyword"].tolist(), from_pdf=from_pdf, target_url=target_url
     )
 
     # Optional URL-column check to block dedicated restaurant/bar/menu PDF URLs for non-hotel queries
@@ -1627,6 +1754,7 @@ def build(
         name,
         from_pdf=used_pdf_tracked,
         allowed_services=allowed_services,
+        target_url=effective_target_url,
     )
 
     prs = Presentation(str(template))

@@ -13,6 +13,7 @@ try:
         SERVICE_LABELS,
         build,
         crawl_target_website,
+        detect_services_in_text,
         extract_workbook_profile,
         property_name,
         property_name_from_xlsx,
@@ -22,6 +23,7 @@ except ImportError:
         SERVICE_LABELS,
         build,
         crawl_target_website,
+        detect_services_in_text,
         extract_workbook_profile,
         property_name,
         property_name_from_xlsx,
@@ -81,11 +83,22 @@ def home():
 def crawl_website_endpoint():
     temp_dir = None
     try:
-        target_url = (request.form.get('target_url') or '').strip()
+        data = request.get_json(silent=True) or {}
+        target_url = (data.get('target_url') or request.form.get('target_url') or '').strip()
+        wb_urls_in = data.get('workbook_urls') or []
+        wb_kws_in = data.get('workbook_keywords') or []
+        prop_title = (data.get('property_title') or '').strip()
         xlsx = request.files.get('xlsx')
 
-        wb_profile = {"services": set(), "keywords": [], "primary_url": "", "urls": []}
-        prop_title = ""
+        wb_profile = {
+            "services": set(),
+            "keywords": [str(k).strip() for k in wb_kws_in if str(k).strip()],
+            "primary_url": wb_urls_in[0].split("?")[0] if wb_urls_in else "",
+            "urls": [str(u).strip() for u in wb_urls_in if str(u).strip()],
+        }
+        if wb_profile["keywords"]:
+            wb_profile["services"] = detect_services_in_text("\n".join(wb_profile["keywords"]))
+
         if xlsx and xlsx.filename:
             temp_dir = tempfile.mkdtemp()
             xlsx_path = Path(temp_dir) / xlsx.filename
@@ -115,6 +128,7 @@ def crawl_website_endpoint():
                 "target_url": crawl_info["target_url"],
                 "page_title": crawl_info["page_title"] or prop_title or crawl_info["target_url"],
                 "crawled_pages": crawl_info["crawled_pages"],
+                "sitemap_urls": crawl_info.get("sitemap_urls", 0),
                 "website_services": [SERVICE_LABELS.get(s, s) for s in sorted(web_svcs)],
                 "workbook_services": [SERVICE_LABELS.get(s, s) for s in sorted(wb_svcs)],
                 "matched_services": [SERVICE_LABELS.get(s, s) for s in sorted(matched_svcs)],
