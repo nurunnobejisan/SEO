@@ -17,11 +17,15 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
+import gzip
+import html as html_lib
 import io
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
+import zlib
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -261,26 +265,55 @@ def extract_workbook_profile(xlsx_path: Path) -> dict:
     }
 
 
-def _fetch_html(url: str, timeout: float = 5.0) -> tuple[str, str]:
+def _fetch_html(url: str, timeout: float = 4.0) -> tuple[str, str]:
     req = urllib.request.Request(
         url,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+            "Upgrade-Insecure-Requests": "1",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(600_000).decode("utf-8", errors="ignore")
-        return raw, resp.geturl()
+        data = resp.read(750_000)
+        enc = (resp.headers.get("Content-Encoding") or "").lower()
+        if "gzip" in enc:
+            data = gzip.decompress(data)
+        elif "deflate" in enc:
+            try:
+                data = zlib.decompress(data, -zlib.MAX_WBITS)
+            except Exception:
+                data = zlib.decompress(data)
+        return data.decode("utf-8", errors="ignore"), resp.geturl()
+
+
+def _fetch_via_reader(url: str, timeout: float = 5.5) -> tuple[str, str]:
+    """Fallback reader for JS-rendered SPAs or bot-protected sites."""
+    reader_url = f"https://r.jina.ai/{url}"
+    req = urllib.request.Request(
+        reader_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "text/plain, text/markdown;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        txt = resp.read(400_000).decode("utf-8", errors="ignore")
+    title = ""
+    m = re.search(r"^Title:\s*(.+)$", txt, re.M)
+    if m:
+        title = clean_text(m.group(1))
+    return title, txt
 
 
 def _html_to_crawl_text(html: str) -> tuple[str, str]:
     title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-    title = clean_text(re.sub(r"<[^>]+>", " ", title_m.group(1))) if title_m else ""
+    title = html_lib.unescape(clean_text(re.sub(r"<[^>]+>", " ", title_m.group(1)))) if title_m else ""
     meta_parts = re.findall(
         r'<meta[^>]+(?:name|property)=["\'](?:description|og:title|og:description|keywords)["\'][^>]+content=["\']([^"\']+)["\']',
         html,
@@ -292,63 +325,80 @@ def _html_to_crawl_text(html: str) -> tuple[str, str]:
         re.I,
     )
     cleaned_html = re.sub(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
-    visible = clean_text(re.sub(r"<[^>]+>", " ", cleaned_html))
-    return title, " ".join([title] + meta_parts + [visible])
+    visible = html_lib.unescape(clean_text(re.sub(r"<[^>]+>", " ", cleaned_html)))
+    return title, " ".join([title] + [html_lib.unescape(p) for p in meta_parts] + [visible])
 
 
-def _discover_sitemap_urls(base_url: str, timeout: float = 3.5) -> list[str]:
-    """Discover all internal page URLs from robots.txt and XML sitemaps (including sitemap indexes)."""
+def _extract_headings_from_html(html: str) -> list[str]:
+    cleaned_html = re.sub(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
+    headings: list[str] = []
+    for m in re.findall(r"<h[12][^>]*>(.*?)</h[12]>", cleaned_html, re.I | re.S):
+        txt = html_lib.unescape(clean_text(re.sub(r"<[^>]+>", " ", m)))
+        if (
+            4 <= len(txt) <= 80
+            and txt not in headings
+            and not re.search(r"[{}]|page\.title|\+\s*['\"]", txt)
+        ):
+            headings.append(txt)
+    return headings[:12]
+
+
+def _discover_sitemap_urls(base_url: str, timeout: float = 2.8) -> list[str]:
+    """Discover internal page URLs from robots.txt and XML sitemaps in parallel."""
     parsed = urllib.parse.urlparse(base_url)
     if not parsed.scheme or not parsed.netloc:
         return []
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    sitemap_candidates: list[str] = []
-
-    try:
-        robots_txt, _ = _fetch_html(f"{origin}/robots.txt", timeout=2.5)
-        for m in re.findall(r"(?i)^sitemap:\s*(\S+)", robots_txt, re.M):
-            sm_u = m.strip()
-            if sm_u not in sitemap_candidates:
-                sitemap_candidates.append(sm_u)
-    except Exception:
-        pass
-
-    for default_sm in (f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml"):
-        if default_sm not in sitemap_candidates:
-            sitemap_candidates.append(default_sm)
+    probes = [f"{origin}/robots.txt", f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml"]
 
     discovered_pages: list[str] = []
     child_sitemaps: list[str] = []
+    extra_sitemaps: list[str] = []
 
-    for sm_url in sitemap_candidates[:2]:
+    def _probe(u: str) -> tuple[str, str]:
         try:
-            xml_txt, _ = _fetch_html(sm_url, timeout=timeout)
-            locs = [u.strip() for u in re.findall(r"<loc>(.*?)</loc>", xml_txt, re.I | re.S) if u.strip()]
-            if "<sitemapindex" in xml_txt.lower():
-                for loc in locs:
-                    if loc not in child_sitemaps:
-                        child_sitemaps.append(loc)
-            else:
-                for loc in locs:
-                    if loc not in discovered_pages:
-                        discovered_pages.append(loc)
-            if locs:
-                break
+            txt, _ = _fetch_html(u, timeout=timeout)
+            return u, txt
         except Exception:
-            pass
+            return u, ""
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = dict(pool.map(_probe, probes))
+
+    robots_txt = results.get(f"{origin}/robots.txt", "")
+    for m in re.findall(r"(?i)^sitemap:\s*(\S+)", robots_txt, re.M):
+        sm_u = m.strip()
+        if sm_u and sm_u not in probes and sm_u not in extra_sitemaps:
+            extra_sitemaps.append(sm_u)
+
+    def _parse_sm(xml_txt: str) -> None:
+        if not xml_txt:
+            return
+        locs = [u.strip() for u in re.findall(r"<loc>(.*?)</loc>", xml_txt, re.I | re.S) if u.strip()]
+        if "<sitemapindex" in xml_txt.lower():
+            for loc in locs:
+                if loc not in child_sitemaps:
+                    child_sitemaps.append(loc)
+        else:
+            for loc in locs:
+                if loc not in discovered_pages:
+                    discovered_pages.append(loc)
+
+    _parse_sm(results.get(f"{origin}/sitemap.xml", ""))
+    if not discovered_pages and not child_sitemaps:
+        _parse_sm(results.get(f"{origin}/sitemap_index.xml", ""))
+    for sm_u in extra_sitemaps[:2]:
+        if discovered_pages or child_sitemaps:
+            break
+        _, xml_txt = _probe(sm_u)
+        _parse_sm(xml_txt)
 
     if child_sitemaps:
-        def _fetch_child(c_url: str) -> list[str]:
-            try:
-                c_xml, _ = _fetch_html(c_url, timeout=timeout)
-                return [u.strip() for u in re.findall(r"<loc>(.*?)</loc>", c_xml, re.I | re.S) if u.strip()]
-            except Exception:
-                return []
-
         with ThreadPoolExecutor(max_workers=6) as pool:
-            for page_locs in pool.map(_fetch_child, child_sitemaps[:8]):
-                for loc in page_locs:
-                    if loc not in discovered_pages:
+            for _, c_xml in pool.map(_probe, child_sitemaps[:8]):
+                for loc in re.findall(r"<loc>(.*?)</loc>", c_xml, re.I | re.S):
+                    loc = loc.strip()
+                    if loc and loc not in discovered_pages:
                         discovered_pages.append(loc)
 
     return discovered_pages
@@ -360,19 +410,24 @@ def crawl_target_website(
     workbook_urls: list[str] | None = None,
     workbook_keywords: list[str] | None = None,
 ) -> dict:
-    """Crawl the target hotel website across sitemaps, navigation links, and service subpages."""
+    """Universal website crawler: works on any website (hotels, agencies, SaaS, ecommerce, WAF/JS sites)."""
     url = (target_url or "").strip()
     if url and not re.match(r"^https?://", url, re.I):
         url = "https://" + url
 
+    deadline = time.monotonic() + 9.0
     crawled_pages = 0
+    crawled_urls: list[str] = []
     sitemap_url_count = 0
     page_title = ""
     url_slug_chunks: list[str] = []
     body_chunks: list[str] = []
+    page_topics: list[str] = []
 
-    service_slug_re = re.compile(
-        r"(?:amenit|spa|dining|restaurant|meeting|wedding|event|gather|venue|room|suite|pool|accommodat|overview|experience|offer|package|pet|family|golf|casino|resort|boutique)",
+    priority_slug_re = re.compile(
+        r"(?:amenit|spa|dining|restaurant|meeting|wedding|event|gather|venue|room|suite|pool|"
+        r"accommodat|overview|experience|offer|package|pet|family|golf|casino|resort|boutique|"
+        r"service|solution|product|feature|pricing|about|work|portfolio|case|menu|shop|store|categor)",
         re.I,
     )
 
@@ -381,8 +436,26 @@ def crawl_target_website(
         slug_text = re.sub(r"[^a-z0-9]+", " ", parsed.path.lower())
         url_slug_chunks.append(slug_text)
 
-        # 1. Discover full website structure via XML sitemaps + robots.txt
-        sitemap_urls = _discover_sitemap_urls(url)
+        # Run sitemap discovery and homepage fetch concurrently within budget
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            sm_future = pool.submit(_discover_sitemap_urls, url, 2.5)
+            def _fetch_home() -> tuple[str, str]:
+                try:
+                    return _fetch_html(url, timeout=4.0)
+                except Exception:
+                    return "", url
+            home_future = pool.submit(_fetch_home)
+            sitemap_urls = sm_future.result()
+            html, final_url = home_future.result()
+
+        # If target_url points to a specific property path on a multi-property domain (e.g. marriott.com/.../mslbr-.../),
+        # scope sitemap URLs to that property so other properties on the chain domain don't pollute services
+        path_parts = [p for p in parsed.path.strip("/").split("/") if p and p not in ("en", "en-us", "hotels", "hotel", "overview")]
+        if path_parts and len(sitemap_urls) > 150:
+            prop_key = path_parts[0].lower()
+            scoped = [u for u in sitemap_urls if prop_key in u.lower()]
+            sitemap_urls = scoped
+
         sitemap_url_count = len(sitemap_urls)
         for sm_u in sitemap_urls:
             try:
@@ -391,17 +464,26 @@ def crawl_target_website(
             except Exception:
                 pass
 
-        # 2. Fetch homepage and discover all internal navigation links
-        sub_candidates: list[str] = []
-        try:
-            html, final_url = _fetch_html(url, timeout=5.0)
-            if "access denied" not in html.lower()[:600]:
-                t, txt = _html_to_crawl_text(html)
+        priority_candidates: list[str] = []
+        general_candidates: list[str] = []
+        base_netloc = urllib.parse.urlparse(final_url or url).netloc.lower().lstrip("www.")
+
+        blocked_or_empty = (
+            not html
+            or "access denied" in html.lower()[:800]
+            or "cf-browser-verification" in html.lower()[:2000]
+        )
+        if not blocked_or_empty:
+            t, txt = _html_to_crawl_text(html)
+            if len(txt) < 180:
+                blocked_or_empty = True
+            else:
                 page_title = t
                 body_chunks.append(txt)
                 crawled_pages += 1
+                crawled_urls.append(final_url or url)
+                page_topics.extend(_extract_headings_from_html(html))
 
-                base_netloc = urllib.parse.urlparse(final_url).netloc.lower().lstrip("www.")
                 hrefs = re.findall(r'href=["\']([^"\'#]+)["\']', html, re.I)
                 for h in hrefs + sitemap_urls:
                     full_u = urllib.parse.urljoin(final_url, h).split("?")[0].rstrip("/")
@@ -410,36 +492,77 @@ def crawl_target_website(
                     if (
                         u_parsed.scheme in ("http", "https")
                         and u_netloc == base_netloc
-                        and full_u != final_url.rstrip("/")
-                        and not re.search(r"\.(?:pdf|jpg|jpeg|png|gif|webp|svg|css|js|xml|zip)$", u_parsed.path, re.I)
+                        and full_u != (final_url or url).rstrip("/")
+                        and not re.search(
+                            r"\.(?:pdf|jpg|jpeg|png|gif|webp|svg|css|js|xml|zip|ico|woff2?|mp4)$",
+                            u_parsed.path,
+                            re.I,
+                        )
                     ):
                         url_slug_chunks.append(re.sub(r"[^a-z0-9]+", " ", u_parsed.path.lower()))
-                        if service_slug_re.search(u_parsed.path) and full_u not in sub_candidates:
-                            sub_candidates.append(full_u)
-        except Exception:
-            for sm_u in sitemap_urls:
-                if service_slug_re.search(sm_u) and sm_u not in sub_candidates:
-                    sub_candidates.append(sm_u)
-
-        # 3. Crawl up to 12 key service pages concurrently for deep content verification
-        if sub_candidates:
-            def _fetch_subpage(sub_u: str) -> tuple[str, str] | None:
+                        if priority_slug_re.search(u_parsed.path):
+                            if full_u not in priority_candidates:
+                                priority_candidates.append(full_u)
+                        elif full_u not in general_candidates:
+                            general_candidates.append(full_u)
+        else:
+            # Fallback to Jina Reader for JS-only SPAs or bot-protected sites
+            if time.monotonic() < deadline - 1.5:
                 try:
-                    sub_html, _ = _fetch_html(sub_u, timeout=3.5)
+                    rt, rtxt = _fetch_via_reader(url, timeout=4.5)
+                    if rtxt and "Access Denied" not in rtxt[:400]:
+                        page_title = page_title or rt
+                        body_chunks.append(rtxt)
+                        crawled_pages += 1
+                        crawled_urls.append(url)
+                        for m in re.findall(r"^#{1,2}\s+(.+)$", rtxt, re.M):
+                            hm = clean_text(m)
+                            if 4 <= len(hm) <= 80 and hm not in page_topics:
+                                page_topics.append(hm)
+                        for link_u in re.findall(r"https?://[^\s\)\"'>]+", rtxt):
+                            lu_parsed = urllib.parse.urlparse(link_u.split("?")[0].rstrip("/"))
+                            if lu_parsed.netloc.lower().lstrip("www.") == base_netloc:
+                                if priority_slug_re.search(lu_parsed.path):
+                                    if link_u not in priority_candidates:
+                                        priority_candidates.append(link_u)
+                                elif link_u not in general_candidates:
+                                    general_candidates.append(link_u)
+                except Exception:
+                    pass
+
+            for sm_u in sitemap_urls:
+                if priority_slug_re.search(sm_u):
+                    if sm_u not in priority_candidates:
+                        priority_candidates.append(sm_u)
+                elif sm_u not in general_candidates:
+                    general_candidates.append(sm_u)
+
+        sub_candidates = (priority_candidates + general_candidates)[:10]
+        if sub_candidates and time.monotonic() < deadline - 1.0:
+            rem_timeout = max(1.5, min(3.0, deadline - time.monotonic()))
+
+            def _fetch_subpage(sub_u: str) -> tuple[str, str, str, list[str]] | None:
+                try:
+                    sub_html, _ = _fetch_html(sub_u, timeout=rem_timeout)
                     if "access denied" not in sub_html.lower()[:600]:
-                        return _html_to_crawl_text(sub_html)
+                        sub_t, sub_txt = _html_to_crawl_text(sub_html)
+                        return sub_u, sub_t, sub_txt, _extract_headings_from_html(sub_html)
                 except Exception:
                     pass
                 return None
 
             with ThreadPoolExecutor(max_workers=6) as pool:
-                for res in pool.map(_fetch_subpage, sub_candidates[:12]):
+                for res in pool.map(_fetch_subpage, sub_candidates):
                     if res is not None:
-                        sub_t, sub_txt = res
+                        sub_u, sub_t, sub_txt, sub_h = res
                         if not page_title and sub_t:
                             page_title = sub_t
                         body_chunks.append(sub_txt)
                         crawled_pages += 1
+                        crawled_urls.append(sub_u)
+                        for h in sub_h:
+                            if h not in page_topics and len(page_topics) < 16:
+                                page_topics.append(h)
 
     if workbook_urls:
         for wu in workbook_urls[:300]:
@@ -457,21 +580,22 @@ def crawl_target_website(
     slug_combined = "\n".join(url_slug_chunks)
     body_combined = "\n".join(body_chunks)
 
-    # Structural property types (spa, pool, resort, casino, golf, ski, all_inclusive, boutique, hot_tub)
-    # must appear in the property title, URL paths, or sitemap/navigation structure (not incidental blog prose)
+    # Structural property types must appear in property title, URL paths, or sitemap/nav structure
     structural_only = {"spa", "pool", "resort", "casino", "golf", "ski", "all_inclusive", "boutique", "hot_tub"}
     slug_services = detect_services_in_text(slug_combined)
     body_services = detect_services_in_text(body_combined)
     website_services = slug_services | (body_services - structural_only)
-    if url or slug_combined.strip() or body_combined.strip():
+    if re.search(r"\b(?:hotels?|resorts?|inns?|motels?|lodging|suites?|accommodations?)\b", slug_combined + " " + body_combined, re.I):
         website_services.add("lodging")
 
     return {
         "target_url": url,
         "page_title": page_title,
         "crawled_pages": crawled_pages,
+        "crawled_urls": crawled_urls[:12],
         "sitemap_urls": sitemap_url_count,
         "services": website_services,
+        "page_topics": page_topics[:12],
     }
 
 
