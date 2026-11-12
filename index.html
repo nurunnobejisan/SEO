@@ -100,6 +100,7 @@
             const [error, setError] = useState("");
             const [successMsg, setSuccessMsg] = useState("");
             const [reportSummary, setReportSummary] = useState(null);
+            const slimCacheRef = useRef({});
             useEffect(() => { lucide.createIcons(); });
             const readyCount = (template ? 1 : 0) + (xlsx ? 1 : 0);
 
@@ -127,6 +128,10 @@
 
             const slimWorkbookIfNeeded = async (file) => {
                 if (!file || typeof XLSX === "undefined") return { slimFile: file, keywords: [], urls: [] };
+                const cacheKey = `${file.name}:${file.size}:${file.lastModified}`;
+                if (slimCacheRef.current[cacheKey]) {
+                    return slimCacheRef.current[cacheKey];
+                }
                 try {
                     const buf = await file.arrayBuffer();
                     const wb = XLSX.read(buf, { type: "array" });
@@ -162,9 +167,13 @@
                         const outArray = XLSX.write(newWb, { bookType: "xlsx", type: "array", compression: true });
                         const slimBlob = new Blob([outArray], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
                         const slimFile = new File([slimBlob], file.name, { type: slimBlob.type });
-                        return { slimFile, keywords, urls };
+                        const res = { slimFile, keywords, urls };
+                        slimCacheRef.current[cacheKey] = res;
+                        return res;
                     }
-                    return { slimFile: file, keywords, urls };
+                    const res = { slimFile: file, keywords, urls };
+                    slimCacheRef.current[cacheKey] = res;
+                    return res;
                 } catch (e) {
                     console.warn("Workbook client parse fallback:", e);
                     return { slimFile: file, keywords: [], urls: [] };

@@ -22,6 +22,7 @@ import html as html_lib
 import io
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -404,6 +405,11 @@ def _discover_sitemap_urls(base_url: str, timeout: float = 2.8) -> list[str]:
     return discovered_pages
 
 
+_CRAWL_CACHE: dict[str, tuple[float, dict]] = {}
+_CRAWL_CACHE_LOCK = threading.Lock()
+_CRAWL_CACHE_TTL = 900.0  # 15 minutes
+
+
 def crawl_target_website(
     target_url: str,
     fallback_text: str = "",
@@ -415,7 +421,16 @@ def crawl_target_website(
     if url and not re.match(r"^https?://", url, re.I):
         url = "https://" + url
 
-    deadline = time.monotonic() + 9.0
+    cache_key = f"{url.lower()}|{(fallback_text or '').strip().lower()}|{len(workbook_urls or [])}"
+    if url:
+        with _CRAWL_CACHE_LOCK:
+            cached = _CRAWL_CACHE.get(cache_key)
+            if cached and (time.monotonic() - cached[0]) < _CRAWL_CACHE_TTL:
+                res_copy = dict(cached[1])
+                res_copy["services"] = set(cached[1]["services"])
+                return res_copy
+
+    deadline = time.monotonic() + 5.5
     crawled_pages = 0
     crawled_urls: list[str] = []
     sitemap_url_count = 0
@@ -440,10 +455,10 @@ def crawl_target_website(
 
         # Run sitemap discovery and homepage fetch concurrently within budget
         with ThreadPoolExecutor(max_workers=2) as pool:
-            sm_future = pool.submit(_discover_sitemap_urls, url, 2.8)
+            sm_future = pool.submit(_discover_sitemap_urls, url, 2.0)
             def _fetch_home() -> tuple[str, str]:
                 try:
-                    return _fetch_html(url, timeout=5.5)
+                    return _fetch_html(url, timeout=3.8)
                 except Exception:
                     return "", url
             home_future = pool.submit(_fetch_home)
@@ -541,8 +556,8 @@ def crawl_target_website(
                     general_candidates.append(sm_u)
 
         sub_candidates = (priority_candidates + general_candidates)[:10]
-        if sub_candidates and time.monotonic() < deadline - 1.0:
-            rem_timeout = max(1.5, min(3.0, deadline - time.monotonic()))
+        if sub_candidates and time.monotonic() < deadline - 0.8:
+            rem_timeout = max(1.2, min(2.2, deadline - time.monotonic()))
 
             def _fetch_subpage(sub_u: str) -> tuple[str, str, str, list[str]] | None:
                 try:
@@ -554,7 +569,7 @@ def crawl_target_website(
                     pass
                 return None
 
-            with ThreadPoolExecutor(max_workers=6) as pool:
+            with ThreadPoolExecutor(max_workers=10) as pool:
                 for res in pool.map(_fetch_subpage, sub_candidates):
                     if res is not None:
                         sub_u, sub_t, sub_txt, sub_h = res
@@ -591,7 +606,7 @@ def crawl_target_website(
     if re.search(r"\b(?:hotels?|resorts?|inns?|motels?|lodging|suites?|accommodations?)\b", slug_combined + " " + body_combined, re.I):
         website_services.add("lodging")
 
-    return {
+    result = {
         "target_url": url,
         "page_title": page_title,
         "crawled_pages": crawled_pages,
@@ -600,6 +615,14 @@ def crawl_target_website(
         "services": website_services,
         "page_topics": page_topics[:12],
     }
+    if url:
+        with _CRAWL_CACHE_LOCK:
+            if len(_CRAWL_CACHE) > 64:
+                _CRAWL_CACHE.clear()
+            cached_copy = dict(result)
+            cached_copy["services"] = set(website_services)
+            _CRAWL_CACHE[cache_key] = (time.monotonic(), cached_copy)
+    return result
 
 
 def keyword_matches_services(
