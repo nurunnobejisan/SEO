@@ -1237,9 +1237,11 @@ def keyword_rows(
 
 
 def set_cell(cell, value, is_keyword=False) -> None:
-    """Force Source Sans Pro, Size 9 for all inserted keywords/values."""
+    """Force Source Sans Pro, Size 9 for all inserted keywords/values and remove leftover template paragraphs."""
     text_str = str(value)
     if cell.text_frame.paragraphs:
+        for extra_p in list(cell.text_frame.paragraphs[1:]):
+            extra_p._p.getparent().remove(extra_p._p)
         p = cell.text_frame.paragraphs[0]
         if p.runs:
             p.runs[0].text = text_str
