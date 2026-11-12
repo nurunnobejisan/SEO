@@ -1852,11 +1852,8 @@ def populate_seo_errors_slide(
         if shape.has_text_frame:
             txt_lower = shape.text.lower()
             if "note for seo team" in txt_lower:
-                _strip_highlights_and_spacing(shape)
-                set_paragraph_text(shape.text_frame.paragraphs[0], note_text)
-                if shape.text_frame.paragraphs[0].runs:
-                    shape.text_frame.paragraphs[0].runs[0].font.name = "Source Sans Pro"
-                    shape.text_frame.paragraphs[0].runs[0].font.size = Pt(10.5)
+                # Remove internal SEO Team instruction note from the final client-facing slide
+                shape._element.getparent().remove(shape._element)
             elif "boilerplate" in txt_lower or ("errors" in txt_lower and "warnings" in txt_lower and "seo team" in txt_lower):
                 for i in range(len(shape.text_frame.paragraphs) - 1, 0, -1):
                     p = shape.text_frame.paragraphs[i]
@@ -1909,6 +1906,63 @@ def populate_seo_errors_slide(
         if new_height > max_height:
             new_height = max_height
         errors_slide.shapes.add_picture(io.BytesIO(png_bytes), left, top, width=width, height=new_height)
+
+
+BRAND_HOSTED_DOMAINS = {
+    "marriott.com", "hilton.com", "hyatt.com", "ihg.com", "wyndhamhotels.com",
+    "choicehotels.com", "bestwestern.com", "radissonhotels.com", "accor.com",
+    "fourseasons.com", "omnihotels.com", "loewshotels.com", "sonesta.com",
+    "druryhotels.com", "extendedstayamerica.com", "motel6.com", "redroof.com",
+    "ritzcarlton.com", "starwoodhotels.com", "stayhgi.com",
+}
+
+
+def is_brand_hosted_hotel(
+    prop_name: str,
+    target_url: str = "",
+    workbook_urls: list[str] | None = None,
+    audit_data: dict | None = None,
+) -> bool:
+    """Return True if the property is a brand-hosted hotel (where SEO Errors Report slide must be removed)."""
+    candidate_urls: list[str] = []
+    if target_url:
+        candidate_urls.append(target_url)
+    if audit_data and audit_data.get("audited_url"):
+        candidate_urls.append(audit_data["audited_url"])
+    if workbook_urls:
+        candidate_urls.extend(workbook_urls[:20])
+
+    for u in candidate_urls:
+        try:
+            u_norm = u if "://" in u else f"https://{u}"
+            netloc = urllib.parse.urlparse(u_norm).netloc.lower().lstrip("www.")
+            if any(netloc == dom or netloc.endswith("." + dom) for dom in BRAND_HOSTED_DOMAINS):
+                return True
+        except Exception:
+            pass
+
+    # If a stand-alone domain was explicitly detected, keep the SEO Errors Report slide
+    if candidate_urls:
+        return False
+
+    # Fallback when no URL is available: check if property name is a major chain brand
+    prop_low = re.sub(r"[^a-z0-9\s]", " ", (prop_name or "").lower())
+    for brand in ALL_CHAIN_BRANDS:
+        brand_low = re.sub(r"[^a-z0-9\s]", " ", brand.lower()).strip()
+        if brand_low and re.search(r"\b" + re.escape(brand_low) + r"\b", prop_low):
+            return True
+    return False
+
+
+def _remove_slide(prs: Presentation, slide_index: int) -> None:
+    """Remove slide at `slide_index` cleanly from a python-pptx Presentation."""
+    if slide_index < 0 or slide_index >= len(prs.slides):
+        return
+    sldIdLst = prs.slides._sldIdLst
+    sldId = sldIdLst[slide_index]
+    rId = sldId.rId
+    prs.part.drop_rel(rId)
+    sldIdLst.remove(sldId)
 
 
 def build(
@@ -1995,8 +2049,21 @@ def build(
         raise ValueError("Template table columns do not match the expected report layout.")
 
     benefits_slide = prs.slides[3]
-    errors_slide = ensure_seo_errors_slide(prs)
-    populate_seo_errors_slide(errors_slide, audit_data, full_list_url, pdf_path=pdf)
+    brand_hotel = is_brand_hosted_hotel(
+        name,
+        target_url=effective_target_url,
+        workbook_urls=wb_profile.get("urls"),
+        audit_data=audit_data,
+    )
+    if brand_hotel:
+        # Remove SEO Errors Report slide(s) for brand-hosted hotels per template note
+        for idx in range(len(prs.slides) - 1, 3, -1):
+            slide_txt = " ".join(s.text for s in prs.slides[idx].shapes if s.has_text_frame).lower()
+            if "seo errors report" in slide_txt or "note for seo team" in slide_txt or idx == 4:
+                _remove_slide(prs, idx)
+    else:
+        errors_slide = ensure_seo_errors_slide(prs)
+        populate_seo_errors_slide(errors_slide, audit_data, full_list_url, pdf_path=pdf)
 
     # Update Insights on Slide 2 before duplicating for overflow slides
     updated_insight = insights(tracked)
