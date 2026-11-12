@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import ipaddress
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from flask import Flask, g, jsonify, request, send_file
 from flask_cors import CORS
+from pptx import Presentation
 from pypdf import PdfReader
 from werkzeug.utils import secure_filename
 
@@ -49,7 +51,7 @@ logger = logging.getLogger("seo_report_app")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024  # 12 MB request ceiling
-CORS(app, expose_headers=["Content-Disposition", "X-Request-Id"])
+CORS(app, expose_headers=["Content-Disposition", "X-Request-Id", "X-Report-Summary"])
 
 MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB per individual file after client slimming
 MAX_CACHE_ENTRIES = 10
@@ -238,6 +240,84 @@ def _write_cache_bytes(cache_key: str, pptx_bytes: bytes) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
+def _extract_report_summary_header(pptx_bytes: bytes, prop_name: str, pdf_uploaded: bool) -> str:
+    """Build a compact base64-encoded JSON summary from the generated PPTX for UI preview."""
+    try:
+        prs = Presentation(io.BytesIO(pptx_bytes))
+        slide_count = len(prs.slides)
+        is_brand_hosted = slide_count < 5
+
+        tracked = []
+        if slide_count >= 2:
+            t_tables = [sh.table for sh in prs.slides[1].shapes if sh.has_table]
+            if t_tables:
+                tbl = t_tables[0]
+                for r in range(1, len(tbl.rows)):
+                    kw = tbl.cell(r, 0).text.strip()
+                    if not kw:
+                        continue
+                    # Strip leading "1. " numbering if present
+                    kw_clean = re.sub(r"^\d+\.\s*", "", kw)
+                    tracked.append(
+                        {
+                            "keyword": kw_clean,
+                            "start": tbl.cell(r, 1).text.strip(),
+                            "current": tbl.cell(r, 2).text.strip(),
+                            "delta": tbl.cell(r, 3).text.strip(),
+                        }
+                    )
+
+        ancillary = []
+        buckets = {"top3": 0, "pos4_10": 0, "pos11_20": 0, "pos21_40": 0}
+        if slide_count >= 3:
+            a_tables = [sh.table for sh in prs.slides[2].shapes if sh.has_table]
+            if a_tables:
+                tbl = a_tables[0]
+                for r in range(1, len(tbl.rows)):
+                    kw = tbl.cell(r, 0).text.strip()
+                    if not kw:
+                        continue
+                    rank_str = tbl.cell(r, 1).text.strip()
+                    vol_str = tbl.cell(r, 2).text.strip()
+                    ancillary.append({"keyword": kw, "rank": rank_str, "volume": vol_str})
+                    try:
+                        rk = int(rank_str)
+                        if rk <= 3:
+                            buckets["top3"] += 1
+                        elif rk <= 10:
+                            buckets["pos4_10"] += 1
+                        elif rk <= 20:
+                            buckets["pos11_20"] += 1
+                        elif rk <= 40:
+                            buckets["pos21_40"] += 1
+                    except ValueError:
+                        pass
+
+        top10_count = buckets["top3"] + buckets["pos4_10"]
+        for item in tracked:
+            try:
+                if 1 <= int(item["current"]) <= 10:
+                    top10_count += 1
+            except ValueError:
+                pass
+
+        summary = {
+            "property_name": prop_name,
+            "slide_count": slide_count,
+            "is_brand_hosted": is_brand_hosted,
+            "pdf_included": pdf_uploaded,
+            "tracked_count": len(tracked),
+            "ancillary_count": len(ancillary),
+            "top10_count": top10_count,
+            "rank_buckets": buckets,
+            "tracked_preview": tracked[:6],
+            "ancillary_preview": ancillary[:10],
+        }
+        return base64.b64encode(json.dumps(summary).encode("utf-8")).decode("ascii")
+    except Exception:
+        return ""
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify(
@@ -359,12 +439,16 @@ def generate_report():
         cached_bytes = _read_cache_bytes(cache_key)
         if cached_bytes is not None:
             _log_event("cache_hit", cache_key=cache_key[:12])
-            return send_file(
+            resp = send_file(
                 io.BytesIO(cached_bytes),
                 as_attachment=True,
                 download_name=download_name,
                 mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             )
+            summary_b64 = _extract_report_summary_header(cached_bytes, name, bool(pdf_path))
+            if summary_b64:
+                resp.headers["X-Report-Summary"] = summary_b64
+            return resp
 
         acquired = _BUILD_SEMAPHORE.acquire(timeout=15.0)
         if not acquired:
@@ -390,6 +474,9 @@ def generate_report():
             mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         )
         response.headers["X-Accel-Buffering"] = "no"
+        summary_b64 = _extract_report_summary_header(pptx_bytes, name, bool(pdf_path))
+        if summary_b64:
+            response.headers["X-Report-Summary"] = summary_b64
         return response
 
     except ValidationError as exc:

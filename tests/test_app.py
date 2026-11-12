@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -101,6 +103,12 @@ class SEOReportAppTests(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 200)
         self.assertIn(".pptx", resp.headers.get("Content-Disposition", ""))
+        summary_b64 = resp.headers.get("X-Report-Summary", "")
+        self.assertTrue(summary_b64)
+        summary = json.loads(base64.b64decode(summary_b64).decode("utf-8"))
+        self.assertEqual(summary["slide_count"], 4)
+        self.assertTrue(summary["is_brand_hosted"])
+        self.assertIn("rank_buckets", summary)
 
         prs = Presentation(io.BytesIO(resp.data))
         # Brand hotel removes Slide 5 (SEO Errors Report) -> 4 slides remain

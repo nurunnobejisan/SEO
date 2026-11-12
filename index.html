@@ -99,8 +99,31 @@
             const [loading, setLoading] = useState(false);
             const [error, setError] = useState("");
             const [successMsg, setSuccessMsg] = useState("");
+            const [reportSummary, setReportSummary] = useState(null);
             useEffect(() => { lucide.createIcons(); });
             const readyCount = (template ? 1 : 0) + (xlsx ? 1 : 0);
+
+            const handleXlsxChange = (file) => {
+                setXlsx(file);
+                setCrawlResult(null);
+                setReportSummary(null);
+                setSuccessMsg("");
+            };
+
+            const handleResetAll = () => {
+                setTemplate(null);
+                setXlsx(null);
+                setPdf(null);
+                setTargetUrl("");
+                setCrawlResult(null);
+                setReportSummary(null);
+                setError("");
+                setSuccessMsg("");
+                ["template", "xlsx", "pdf"].forEach((id) => {
+                    const el = document.getElementById(id);
+                    if (el) el.value = "";
+                });
+            };
 
             const slimWorkbookIfNeeded = async (file) => {
                 if (!file || typeof XLSX === "undefined") return { slimFile: file, keywords: [], urls: [] };
@@ -216,7 +239,9 @@
                             target_url: targetUrl.trim(),
                             workbook_keywords: keywords,
                             workbook_urls: urls,
-                            property_title: xlsx ? xlsx.name.replace(/\.xlsx$/i, "") : "",
+                            property_title: xlsx
+                                ? xlsx.name.replace(/\.xlsx$/i, "").replace(/\s*[-–—]\s*keyword\s*list$/i, "").trim()
+                                : "",
                         }),
                     });
                     const data = await parseJsonResponse(response, "Failed to crawl target website.");
@@ -234,7 +259,7 @@
                     setError("Please upload both the PowerPoint Template (.pptx) and the Keywords Sheet (.xlsx) to continue.");
                     setSuccessMsg(""); return;
                 }
-                setError(""); setSuccessMsg(""); setLoading(true);
+                setError(""); setSuccessMsg(""); setReportSummary(null); setLoading(true);
                 try {
                     validateUploadFile(template, ".pptx", "PowerPoint Template");
                     validateUploadFile(xlsx, ".xlsx", "Keywords Workbook");
@@ -250,6 +275,18 @@
                     
                     if (!response.ok) {
                         await parseJsonResponse(response, "Failed to generate presentation.");
+                    }
+
+                    const summaryHeader = response.headers.get("X-Report-Summary");
+                    if (summaryHeader) {
+                        try {
+                            const binaryStr = atob(summaryHeader);
+                            const bytes = Uint8Array.from(binaryStr, (c) => c.charCodeAt(0));
+                            const decodedJson = new TextDecoder().decode(bytes);
+                            setReportSummary(JSON.parse(decodedJson));
+                        } catch (e) {
+                            console.warn("Could not parse X-Report-Summary header:", e);
+                        }
                     }
 
                     const blob = await response.blob();
@@ -272,7 +309,7 @@
                 } catch (err) {
                     console.error(err); 
                     if (err.message.includes("Failed to fetch")) {
-                        setError(`Failed to fetch: Make sure you are running 'python3 app.py' and viewing this page at http://127.0.0.1:8080.`);
+                        setError("Network error: Could not reach the report generator server. Please check your connection and try again.");
                     } else {
                         setError(err.message);
                     }
@@ -295,12 +332,18 @@
                         <div className="bg-white rounded-3xl shadow-card border border-slate-200/80 p-6 md:p-10">
                             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 mb-8 border-b border-slate-100">
                                 <div><h2 className="font-display text-2xl font-bold text-slate-900">Upload Source Files</h2></div>
+                                {(template || xlsx || pdf || targetUrl || crawlResult || reportSummary) && (
+                                    <button type="button" onClick={handleResetAll} className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-rose-50 hover:text-rose-600 border border-slate-200 hover:border-rose-200 transition-colors w-fit">
+                                        <i data-lucide="rotate-ccw" className="w-3.5 h-3.5"></i>
+                                        Reset All
+                                    </button>
+                                )}
                             </div>
                             {error && (<div className="flex items-start gap-3 bg-rose-50 border border-rose-200 p-4 mb-6 text-rose-800 rounded-2xl"><i data-lucide="alert-circle" className="w-5 h-5 text-rose-600 shrink-0 mt-0.5"></i><div className="text-sm font-medium">{error}</div></div>)}
                             {successMsg && (<div className="flex items-start gap-3 bg-brand-50 border border-brand/30 p-4 mb-6 text-slate-800 rounded-2xl"><i data-lucide="check-circle" className="w-5 h-5 text-brand-dark shrink-0 mt-0.5"></i><div className="text-sm font-semibold">{successMsg}</div></div>)}
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
                                 <FileUploadZone id="template" step={1} label="PowerPoint Template" subtitle="Master slide deck" accept=".pptx" badgeColor="bg-orange-50 text-orange-600 border border-orange-100" icon="presentation" required={true} file={template} setFile={setTemplate} />
-                                <FileUploadZone id="xlsx" step={2} label="Keywords Workbook" subtitle="Excel export" accept=".xlsx" badgeColor="bg-emerald-50 text-emerald-600 border border-emerald-100" icon="file-spreadsheet" required={true} file={xlsx} setFile={setXlsx} />
+                                <FileUploadZone id="xlsx" step={2} label="Keywords Workbook" subtitle="Excel export" accept=".xlsx" badgeColor="bg-emerald-50 text-emerald-600 border border-emerald-100" icon="file-spreadsheet" required={true} file={xlsx} setFile={handleXlsxChange} />
                                 <FileUploadZone id="pdf" step={3} label="Semrush Audit PDF" subtitle="Optional PDF report" accept=".pdf" badgeColor="bg-blue-50 text-blue-600 border border-blue-100" icon="file-text" required={false} file={pdf} setFile={setPdf} />
                             </div>
 
@@ -320,7 +363,7 @@
                                         <input
                                             type="url"
                                             value={targetUrl}
-                                            onChange={(e) => setTargetUrl(e.target.value)}
+                                            onChange={(e) => { setTargetUrl(e.target.value); setCrawlResult(null); }}
                                             placeholder="https://www.marriott.com/en-us/hotels/... or https://www.propertywebsite.com"
                                             className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
                                         />
@@ -379,11 +422,128 @@
                                     </div>
                                 )}
                             </div>
-                            <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-6 shadow-lg">
-                                <button onClick={handleGenerate} disabled={loading} className={`w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 rounded-xl font-display font-bold text-sm transition-all duration-300 ${loading ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-brand text-slate-900 hover:bg-brand-light shadow-glow hover:-translate-y-1 active:translate-y-0'}`}>
+                            <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 flex flex-col lg:flex-row items-center justify-between gap-5 shadow-lg">
+                                <button onClick={handleGenerate} disabled={loading} className={`w-full lg:w-auto flex items-center justify-center gap-2.5 px-8 py-4 rounded-xl font-display font-bold text-sm transition-all duration-300 ${loading ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-brand text-slate-900 hover:bg-brand-light shadow-glow hover:-translate-y-1 active:translate-y-0'}`}>
                                     {loading ? (<><i data-lucide="loader-2" className="w-5 h-5 animate-spin"></i>Building Presentation...</>) : (<><i data-lucide="wand-2" className="w-5 h-5"></i>Generate & Download Deck</>)}
                                 </button>
+                                <div className="flex flex-wrap items-center justify-center lg:justify-end gap-2 text-xs">
+                                    <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full font-medium border ${template ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                                        <span className={`w-1.5 h-1.5 rounded-full ${template ? 'bg-emerald-400' : 'bg-slate-500'}`}></span>
+                                        Template {template ? '✓' : 'Required'}
+                                    </span>
+                                    <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full font-medium border ${xlsx ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                                        <span className={`w-1.5 h-1.5 rounded-full ${xlsx ? 'bg-emerald-400' : 'bg-slate-500'}`}></span>
+                                        Workbook {xlsx ? '✓' : 'Required'}
+                                    </span>
+                                    <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full font-medium border ${pdf ? 'bg-blue-500/15 text-blue-300 border-blue-500/30' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                                        <span className={`w-1.5 h-1.5 rounded-full ${pdf ? 'bg-blue-400' : 'bg-slate-500'}`}></span>
+                                        PDF {pdf ? '✓' : 'Optional'}
+                                    </span>
+                                    <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full font-medium border ${crawlResult ? 'bg-purple-500/15 text-purple-300 border-purple-500/30' : 'bg-slate-800 text-slate-400 border-slate-700'}`}>
+                                        <span className={`w-1.5 h-1.5 rounded-full ${crawlResult ? 'bg-purple-400' : 'bg-slate-500'}`}></span>
+                                        Crawl {crawlResult ? '✓' : 'Optional'}
+                                    </span>
+                                </div>
                             </div>
+
+                            {reportSummary && (
+                                <div className="mt-8 p-6 rounded-2xl border border-slate-200 bg-slate-50/70 space-y-6">
+                                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200/80">
+                                        <div>
+                                            <span className="text-[11px] font-display font-bold uppercase tracking-wider text-slate-400">Generated Deck Overview</span>
+                                            <h3 className="font-display text-lg font-bold text-slate-900">{reportSummary.property_name}</h3>
+                                        </div>
+                                        <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border w-fit ${reportSummary.is_brand_hosted ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'}`}>
+                                            <i data-lucide={reportSummary.is_brand_hosted ? "building-2" : "globe"} className="w-3.5 h-3.5"></i>
+                                            {reportSummary.is_brand_hosted
+                                                ? "Brand-Hosted Hotel • Slide 5 Auto-Removed"
+                                                : "Stand-Alone / Soft-Brand • Slide 5 Included"}
+                                        </span>
+                                    </div>
+
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                        <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+                                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Tracked Keywords</div>
+                                            <div className="font-display text-2xl font-extrabold text-slate-900 mt-1">{reportSummary.tracked_count}</div>
+                                            <div className="text-[11px] text-slate-500 mt-0.5">Slide 2 focus terms</div>
+                                        </div>
+                                        <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+                                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Ancillary (1–40)</div>
+                                            <div className="font-display text-2xl font-extrabold text-slate-900 mt-1">{reportSummary.ancillary_count}</div>
+                                            <div className="text-[11px] text-slate-500 mt-0.5">Slide 3 opportunity mix</div>
+                                        </div>
+                                        <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+                                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Top-10 Rankings</div>
+                                            <div className="font-display text-2xl font-extrabold text-emerald-600 mt-1">{reportSummary.top10_count}</div>
+                                            <div className="text-[11px] text-slate-500 mt-0.5">Page-1 placements</div>
+                                        </div>
+                                        <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+                                            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Total Slides</div>
+                                            <div className="font-display text-2xl font-extrabold text-slate-900 mt-1">{reportSummary.slide_count}</div>
+                                            <div className="text-[11px] text-slate-500 mt-0.5">{reportSummary.pdf_included ? "Semrush PDF included" : "No Semrush PDF"}</div>
+                                        </div>
+                                    </div>
+
+                                    {(() => {
+                                        const b = reportSummary.rank_buckets || { top3: 0, pos4_10: 0, pos11_20: 0, pos21_40: 0 };
+                                        const total = Math.max(1, b.top3 + b.pos4_10 + b.pos11_20 + b.pos21_40);
+                                        return (
+                                            <div className="bg-white p-4 rounded-xl border border-slate-200/80">
+                                                <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+                                                    <span className="text-xs font-bold text-slate-800">Ancillary Keyword Ranking Distribution (Pos 1–40)</span>
+                                                    <div className="flex flex-wrap items-center gap-3 text-[11px] font-medium text-slate-600">
+                                                        <span className="inline-flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-emerald-500"></span>Pos 1–3 ({b.top3})</span>
+                                                        <span className="inline-flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-brand"></span>Pos 4–10 ({b.pos4_10})</span>
+                                                        <span className="inline-flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-amber-400"></span>Pos 11–20 ({b.pos11_20})</span>
+                                                        <span className="inline-flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-sm bg-sky-400"></span>Pos 21–40 ({b.pos21_40})</span>
+                                                    </div>
+                                                </div>
+                                                <div className="w-full h-3 rounded-full bg-slate-100 overflow-hidden flex">
+                                                    {b.top3 > 0 && <div style={{ width: `${(b.top3 / total) * 100}%` }} className="bg-emerald-500 h-full" title={`Pos 1-3: ${b.top3}`}></div>}
+                                                    {b.pos4_10 > 0 && <div style={{ width: `${(b.pos4_10 / total) * 100}%` }} className="bg-brand h-full" title={`Pos 4-10: ${b.pos4_10}`}></div>}
+                                                    {b.pos11_20 > 0 && <div style={{ width: `${(b.pos11_20 / total) * 100}%` }} className="bg-amber-400 h-full" title={`Pos 11-20: ${b.pos11_20}`}></div>}
+                                                    {b.pos21_40 > 0 && <div style={{ width: `${(b.pos21_40 / total) * 100}%` }} className="bg-sky-400 h-full" title={`Pos 21-40: ${b.pos21_40}`}></div>}
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
+
+                                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                                        {reportSummary.tracked_preview && reportSummary.tracked_preview.length > 0 && (
+                                            <div className="bg-white rounded-xl border border-slate-200/80 overflow-hidden">
+                                                <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200/80 text-xs font-bold text-slate-800">Slide 2 • Tracked Keywords Preview</div>
+                                                <div className="divide-y divide-slate-100 text-xs">
+                                                    {reportSummary.tracked_preview.map((row, idx) => (
+                                                        <div key={idx} className="px-4 py-2 flex items-center justify-between gap-2">
+                                                            <span className="font-medium text-slate-700 truncate">{row.keyword}</span>
+                                                            <div className="flex items-center gap-2 shrink-0">
+                                                                <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-semibold">#{row.current}</span>
+                                                                <span className={`px-2 py-0.5 rounded font-semibold ${row.delta.startsWith('+') ? 'bg-emerald-50 text-emerald-700' : row.delta.startsWith('-') ? 'bg-rose-50 text-rose-600' : 'bg-slate-100 text-slate-500'}`}>{row.delta}</span>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                        {reportSummary.ancillary_preview && reportSummary.ancillary_preview.length > 0 && (
+                                            <div className="bg-white rounded-xl border border-slate-200/80 overflow-hidden">
+                                                <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200/80 text-xs font-bold text-slate-800">Slide 3 • Ancillary Keywords Preview</div>
+                                                <div className="divide-y divide-slate-100 text-xs">
+                                                    {reportSummary.ancillary_preview.map((row, idx) => (
+                                                        <div key={idx} className="px-4 py-2 flex items-center justify-between gap-2">
+                                                            <span className="font-medium text-slate-700 truncate">{row.keyword}</span>
+                                                            <div className="flex items-center gap-2 shrink-0">
+                                                                <span className="px-2 py-0.5 rounded bg-brand-50 text-slate-800 font-semibold border border-brand/30">Rank {row.rank}</span>
+                                                                <span className="text-slate-400 font-medium w-14 text-right">Vol {row.volume}</span>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     </main>
                 </div>
