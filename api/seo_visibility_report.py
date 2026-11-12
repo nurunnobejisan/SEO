@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import io
 import re
 import sys
 from difflib import SequenceMatcher
@@ -23,13 +24,15 @@ from pathlib import Path
 
 try:
     import pandas as pd
+    from PIL import Image, ImageDraw, ImageFont
     from pptx import Presentation
+    from pptx.dml.color import RGBColor
     from pptx.util import Pt
     from pypdf import PdfReader
 except ImportError as exc:
     raise SystemExit(
         "Missing a required package. Install them with:\n"
-        "python3 -m pip install python-pptx pypdf openpyxl pandas"
+        "python3 -m pip install python-pptx pypdf openpyxl pandas Pillow"
     ) from exc
 
 
@@ -775,12 +778,370 @@ def insights(tracked: list[dict]) -> str:
     return base
 
 
+def _decode_semrush_pua(text: str) -> str:
+    out = []
+    for ch in text or "":
+        code = ord(ch)
+        if 0xE071 <= code <= 0xE07A:
+            out.append(chr(ord("0") + (code - 0xE071)))
+        elif ch == "\x00":
+            out.append("-")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def parse_site_audit(reader: PdfReader, pdf_path: Path | None = None) -> dict | None:
+    if pymupdf is not None and pdf_path is not None:
+        raw_pages = [page.get_text() for page in pymupdf.open(str(pdf_path))]
+    else:
+        raw_pages = [(p.extract_text() or "") for p in reader.pages]
+
+    pages = [_decode_semrush_pua(t) for t in raw_pages]
+    full_doc = "\n".join(pages)
+    url_match = re.search(r"https?://[^\s|)\x00]+", full_doc)
+    audited_url = url_match.group(0).rstrip(".,;)") if url_match else ""
+
+    start = next((i for i, t in enumerate(pages) if "Site Audit" in t or "Top Issues" in t), None)
+    if start is None:
+        return None
+
+    section = "\n".join(pages[start:])
+    if "Site Audit" in section:
+        section = section.split("Site Audit", 1)[1]
+    section = re.split(r"\b(Backlinks:?|Organic Research|Traffic Analytics)\b", section, maxsplit=1, flags=re.I)[0]
+
+    health_m = re.search(r"Site\s+Health\s+(\d+%)", section, re.I)
+    errors_m = re.search(r"\bErrors\s+(\d[\d,]*)", section, re.I)
+    warnings_m = re.search(r"\bWarnings\s+(\d[\d,]*)", section, re.I)
+    notices_m = re.search(r"\bNotices\s+(\d[\d,]*)", section, re.I)
+    total_pages_m = re.search(r"\bTotal\s+(\d[\d,]*)", section, re.I)
+
+    site_health = health_m.group(1) if health_m else "N/A"
+    errors_count = int(errors_m.group(1).replace(",", "")) if errors_m else 0
+    warnings_count = int(warnings_m.group(1).replace(",", "")) if warnings_m else 0
+    notices_count = int(notices_m.group(1).replace(",", "")) if notices_m else 0
+    crawled_pages = int(total_pages_m.group(1).replace(",", "")) if total_pages_m else 0
+
+    top_issues: list[dict] = []
+    if "Number Of Issues" in section:
+        issues_part = section.split("Number Of Issues", 1)[1]
+    elif "Status Of Issues" in section:
+        issues_part = section.split("Status Of Issues", 1)[1]
+    else:
+        issues_part = ""
+
+    noise_re = re.compile(
+        r"^(?:"
+        r"800\s+BOYLSTON\s+STREET.*"
+        r"|WWW\.SEMRUSH\.COM.*"
+        r"|Generated\s+on\s+.*"
+        r"|.*The\s+report\s+data\s+is\s+taken\s+from\s+Semrush.*"
+        r"|Top\s+Issues(?:\s+Status\s+Of\s+Issues)?(?:\s+Number\s+Of\s+Issues)?"
+        r"|Status\s+Of\s+Issues|Number\s+Of\s+Issues"
+        r"|\d+"
+        r")$",
+        re.I,
+    )
+
+    raw_lines = [clean_text(ln) for ln in issues_part.splitlines() if clean_text(ln)]
+    idx = 0
+    desc_parts: list[str] = []
+    while idx < len(raw_lines):
+        ln = raw_lines[idx]
+        # Case 1: 'Error 1' or 'Warning 10' on one line
+        m_inline = re.match(r"^(Error|Warning|Notice)s?\s+(\d[\d,]*)(?:\s+([+\-]?\d[\d,]*))?$", ln, re.I)
+        # Case 2: 'Error' or 'Warning' alone on one line followed by count on next line
+        m_alone = re.match(r"^(Error|Warning|Notice)s?$", ln, re.I)
+
+        if m_inline and desc_parts:
+            status = m_inline.group(1).capitalize()
+            count = m_inline.group(2)
+            diff = m_inline.group(3) or "0"
+            if not m_inline.group(3) and idx + 1 < len(raw_lines) and re.fullmatch(r"[+\-]?\d[\d,]*", raw_lines[idx + 1]):
+                diff = raw_lines[idx + 1]
+                idx += 1
+            top_issues.append(
+                {
+                    "issue": clean_text(" ".join(desc_parts)),
+                    "status": status,
+                    "count": count,
+                    "diff": diff,
+                }
+            )
+            desc_parts = []
+        elif m_alone and desc_parts and idx + 1 < len(raw_lines) and re.fullmatch(r"\d[\d,]*", raw_lines[idx + 1]):
+            status = m_alone.group(1).capitalize()
+            count = raw_lines[idx + 1]
+            idx += 1
+            diff = "0"
+            if idx + 1 < len(raw_lines) and re.fullmatch(r"[+\-]?\d[\d,]*", raw_lines[idx + 1]):
+                diff = raw_lines[idx + 1]
+                idx += 1
+            top_issues.append(
+                {
+                    "issue": clean_text(" ".join(desc_parts)),
+                    "status": status,
+                    "count": count,
+                    "diff": diff,
+                }
+            )
+            desc_parts = []
+        elif noise_re.match(ln):
+            pass
+        else:
+            desc_parts.append(ln)
+        idx += 1
+
+    return {
+        "site_health": site_health,
+        "errors": errors_count,
+        "warnings": warnings_count,
+        "notices": notices_count,
+        "crawled_pages": crawled_pages,
+        "top_issues": top_issues,
+        "audited_url": audited_url,
+    }
+
+
+def _load_pil_font(size: int, bold: bool = False):
+    candidates = (
+        [
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ]
+        if bold
+        else [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    )
+    for path in candidates:
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def render_top_issues_image(top_issues: list[dict]) -> tuple[bytes, int, int]:
+    """Render a Semrush 'Top Issues' table screenshot matching the template style and size."""
+    rows = top_issues or [
+        {"issue": "No critical top issues reported in this audit period", "status": "Notice", "count": "0", "diff": "0"}
+    ]
+    scale = 3
+    width = 512 * scale
+    header_h = 28 * scale
+    row_h = 37 * scale
+    height = header_h + row_h * len(rows) + 3 * scale
+
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    font_hdr = _load_pil_font(10 * scale, bold=False)
+    font_issue = _load_pil_font(11 * scale, bold=False)
+    font_badge = _load_pil_font(10 * scale, bold=False)
+    font_count = _load_pil_font(11 * scale, bold=False)
+    font_diff = _load_pil_font(9 * scale, bold=False)
+
+    draw.rectangle([0, 0, width, header_h], fill=(246, 248, 250))
+    draw.line([0, header_h, width, header_h], fill=(230, 234, 240), width=scale)
+
+    col1_x = 10 * scale
+    col2_x = 250 * scale
+    col3_right = width - 12 * scale
+
+    draw.text((col1_x, 8 * scale), "Top Issues", fill=(65, 75, 88), font=font_hdr)
+    draw.text((col2_x, 8 * scale), "Status Of Issues", fill=(65, 75, 88), font=font_hdr)
+    hdr3_w = draw.textbbox((0, 0), "Number Of Issues", font=font_hdr)[2]
+    draw.text((col3_right - hdr3_w, 8 * scale), "Number Of Issues", fill=(65, 75, 88), font=font_hdr)
+
+    y = header_h
+    for item in rows:
+        words = item["issue"].split()
+        lines: list[str] = []
+        cur = ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if draw.textbbox((0, 0), test, font=font_issue)[2] <= 232 * scale:
+                cur = test
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        lines = lines[:2]
+
+        if len(lines) == 1:
+            draw.text((col1_x, y + 11 * scale), lines[0], fill=(34, 40, 49), font=font_issue)
+        else:
+            draw.text((col1_x, y + 5 * scale), lines[0], fill=(34, 40, 49), font=font_issue)
+            draw.text((col1_x, y + 19 * scale), lines[1], fill=(34, 40, 49), font=font_issue)
+
+        st = item["status"]
+        if st.lower() == "error":
+            bg_col = (253, 232, 232)
+            fg_col = (224, 82, 82)
+        elif st.lower() == "warning":
+            bg_col = (254, 240, 230)
+            fg_col = (232, 124, 62)
+        else:
+            bg_col = (232, 244, 253)
+            fg_col = (43, 125, 233)
+
+        tw = draw.textbbox((0, 0), st, font=font_badge)[2]
+        pad_x = 8 * scale
+        pill_w = tw + pad_x * 2
+        pill_h = 16 * scale
+        pill_y = y + 10 * scale
+        draw.rounded_rectangle([col2_x, pill_y, col2_x + pill_w, pill_y + pill_h], radius=8 * scale, fill=bg_col)
+        draw.text((col2_x + pad_x, pill_y + 2 * scale), st, fill=fg_col, font=font_badge)
+
+        cnt_str = str(item.get("count", "0"))
+        diff_str = str(item.get("diff", "0"))
+        cnt_w = draw.textbbox((0, 0), cnt_str, font=font_count)[2]
+        draw.text((col3_right - cnt_w, y + 6 * scale), cnt_str, fill=(34, 40, 49), font=font_count)
+        diff_w = draw.textbbox((0, 0), diff_str, font=font_diff)[2]
+        draw.text((col3_right - diff_w, y + 21 * scale), diff_str, fill=(136, 146, 160), font=font_diff)
+
+        y += row_h
+        draw.line([0, y, width, y], fill=(235, 238, 243), width=scale)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), width, height
+
+
+def ensure_seo_errors_slide(prs: Presentation):
+    """Return existing SEO Errors Report slide or create one from Slide 4 if the template only has 4 slides."""
+    if len(prs.slides) > 4:
+        return prs.slides[4]
+    new_slide = duplicate_slide(prs, 3, 4)
+    for shape in list(new_slide.shapes):
+        if shape.shape_type == 14 and shape.has_text_frame:
+            set_paragraph_text(shape.text_frame.paragraphs[0], "SEO Errors Report")
+        elif shape.shape_type == 17 and shape.top > 1000000:
+            shape._element.getparent().remove(shape._element)
+
+    card = new_slide.shapes.add_shape(1, 5551900, 1402100, 2781900, 3164700)
+    card.fill.solid()
+    card.fill.fore_color.rgb = RGBColor(0xEE, 0xEE, 0xEE)
+    card.line.fill.background()
+
+    note_box = new_slide.shapes.add_textbox(1299350, 830300, 4683900, 548700)
+    note_box.text_frame.word_wrap = True
+    note_box.text_frame.paragraphs[0].text = "NOTE FOR SEO TEAM:"
+
+    exp_box = new_slide.shapes.add_textbox(5655600, 1550675, 2613600, 2993700)
+    exp_box.text_frame.word_wrap = True
+    exp_box.text_frame.paragraphs[0].text = "[SEO Team to insert a short boilerplate explanation]"
+    return new_slide
+
+
+def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: str = "") -> None:
+    """Populate Slide 5 (SEO Errors Report) with the follow-up note, Top Issues screenshot, and boilerplate summary."""
+    note_text = (
+        "NOTE FOR SEO TEAM:  This slide only applies to stand-alone sites for soft brands or independents.  "
+        "Remove this slide for brand hotels."
+    )
+
+    if audit:
+        err_cnt = audit["errors"]
+        warn_cnt = audit["warnings"]
+        health = audit["site_health"]
+        crawled = audit["crawled_pages"]
+        top_errors = [x["issue"] for x in audit["top_issues"] if x["status"].lower() == "error"]
+        top_warnings = [x["issue"] for x in audit["top_issues"] if x["status"].lower() == "warning"]
+
+        err_detail = f": {'; '.join(top_errors)}" if top_errors else ""
+        warn_detail = f", including: {'; '.join(top_warnings[:3])}" if top_warnings else ""
+        health_clause = f"Site Health is at {health} across {crawled} crawled pages. " if crawled else ""
+
+        explanation_text = (
+            f"{health_clause}“Errors” ({err_cnt} found{err_detail}) are critical technical issues that impact "
+            f"crawlability and indexation, while “Warnings” ({warn_cnt} found{warn_detail}) highlight on-page "
+            f"optimization opportunities.\n\n"
+            f"If we host the site, our team will fix all errors and warnings and report here once all are fixed, "
+            f"including adding missing <h> or alt tags. If a warning requires new copy to be written or is for a "
+            f"site we do not host (such as low text-HTML ratio, title tag length, or missing <h> tags), it will "
+            f"be for the AM to address with the site host."
+        )
+        report_url = full_list_url or audit.get("audited_url", "")
+    else:
+        explanation_text = (
+            "“Errors” represent critical technical SEO issues that prevent search engines from properly crawling "
+            "or indexing site pages, while “Warnings” highlight lower-priority on-page optimization opportunities.\n\n"
+            "If we host the site, our team will fix all errors and warnings and report here once all are fixed, "
+            "including adding missing <h> tags if any are missing. If a warning requires new copy to be written "
+            "or is for a site we do not host (such as low text-HTML ratio or missing <h> tags), it will be for "
+            "the AM to address with the site host."
+        )
+        report_url = full_list_url
+
+    for shape in list(errors_slide.shapes):
+        if shape.has_text_frame:
+            txt_lower = shape.text.lower()
+            if "note for seo team" in txt_lower:
+                set_paragraph_text(shape.text_frame.paragraphs[0], note_text)
+                if shape.text_frame.paragraphs[0].runs:
+                    shape.text_frame.paragraphs[0].runs[0].font.name = "Source Sans Pro"
+                    shape.text_frame.paragraphs[0].runs[0].font.size = Pt(11)
+            elif "boilerplate" in txt_lower or ("errors" in txt_lower and "warnings" in txt_lower and "seo team" in txt_lower):
+                for i in range(len(shape.text_frame.paragraphs) - 1, 0, -1):
+                    p = shape.text_frame.paragraphs[i]
+                    p._p.getparent().remove(p._p)
+
+                p0 = shape.text_frame.paragraphs[0]
+                for child in list(p0._p):
+                    if child.tag.endswith("}br"):
+                        p0._p.remove(child)
+                set_paragraph_text(p0, explanation_text)
+                if p0.runs:
+                    p0.runs[0].font.name = "Source Sans Pro"
+                    p0.runs[0].font.size = Pt(9)
+                    p0.runs[0].font.color.rgb = RGBColor(0x22, 0x22, 0x22)
+
+                p_link = shape.text_frame.add_paragraph()
+                link_run = p_link.add_run()
+                link_run.text = "\nFull Error & Warning Audit Report"
+                link_run.font.name = "Source Sans Pro"
+                link_run.font.size = Pt(9)
+                link_run.font.bold = True
+                if report_url:
+                    link_run.hyperlink.address = report_url
+
+    # Replace or add the Top Issues screenshot picture on Slide 5
+    target_pic = None
+    for shape in errors_slide.shapes:
+        if shape.shape_type == 13 and shape.left < 2000000 and shape.top > 1200000:
+            target_pic = shape
+            break
+    if audit and audit.get("top_issues"):
+        if target_pic is not None:
+            left, top, width = target_pic.left, target_pic.top, target_pic.width
+            target_pic._element.getparent().remove(target_pic._element)
+        else:
+            left, top, width = 696125, 1827925, 4683900
+        png_bytes, img_w, img_h = render_top_issues_image(audit["top_issues"])
+        new_height = int(width * (img_h / img_w))
+        max_height = 5143500 - top - 250000
+        if new_height > max_height:
+            new_height = max_height
+        errors_slide.shapes.add_picture(io.BytesIO(png_bytes), left, top, width=width, height=new_height)
+
+
 def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_url: str = "") -> None:
+    audit_data = None
     if pdf:
         try:
             reader = PdfReader(str(pdf))
             name = property_name(reader, pdf)
             tracked = parse_tracked_keywords(reader, pdf)
+            audit_data = parse_site_audit(reader, pdf)
         except Exception as exc:
             raise ValueError(f"Could not read ranking data from the PDF ({pdf.name}): {exc}. Remove the PDF to use Excel ranking data instead.") from exc
     else:
@@ -808,17 +1169,9 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
     if len(slide2_table.columns) < 4 or len(ancillary_table.columns) < 3:
         raise ValueError("Template table columns do not match the expected report layout.")
 
-    # Remove slide 5 (SEO Errors Report) from template before inserting any overflow slides
-    if len(prs.slides) > 4:
-        fifth = prs.slides[4]
-        full_slide5_text = " ".join(s.text for s in fifth.shapes if s.has_text_frame).lower()
-        if "[seo team to insert" in full_slide5_text or "seo errors" in full_slide5_text:
-            ids = prs.slides._sldIdLst
-            sid = list(ids)[4]
-            prs.part.drop_rel(sid.rId)
-            ids.remove(sid)
-
     benefits_slide = prs.slides[3]
+    errors_slide = ensure_seo_errors_slide(prs)
+    populate_seo_errors_slide(errors_slide, audit_data, full_list_url)
 
     # Update Insights on Slide 2 before duplicating for overflow slides
     updated_insight = insights(tracked)

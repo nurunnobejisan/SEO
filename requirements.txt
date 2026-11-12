@@ -5,4 +5,5 @@ pypdf
 pymupdf
 openpyxl
 pandas
+Pillow
 werkzeug
