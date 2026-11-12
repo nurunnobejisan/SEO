@@ -404,11 +404,29 @@ def _keyword_topic_signature(kw: str, target_locs: set[str]) -> tuple:
     core = sorted({_stem_word(t) for t in tokens if t not in CONNECTORS and t not in target_locs})
     return tuple(core)
 
-def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> list[dict]:
+def _decode_semrush_pua(text: str) -> str:
+    out = []
+    for ch in text or "":
+        code = ord(ch)
+        if 0xE071 <= code <= 0xE07A:
+            out.append(chr(ord("0") + (code - 0xE071)))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _extract_pdf_pages(reader: PdfReader, pdf_path: Path | None = None) -> list[str]:
+    """Extract text per page using pypdf first (consistent across macOS & Vercel), falling back to pymupdf."""
+    pages = [_decode_semrush_pua(p.extract_text() or "") for p in reader.pages]
+    if any(p.strip() for p in pages):
+        return pages
     if pymupdf is not None and pdf_path is not None:
-        pages = [page.get_text() for page in pymupdf.open(str(pdf_path))]
-    else:
-        pages = [(p.extract_text() or "") for p in reader.pages]
+        return [_decode_semrush_pua(page.get_text() or "") for page in pymupdf.open(str(pdf_path))]
+    return pages
+
+
+def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> list[dict]:
+    pages = _extract_pdf_pages(reader, pdf_path)
     start = next((i for i, text in enumerate(pages) if "Keyword Rankings" in text), None)
     if start is None:
         raise ValueError("The PDF has no 'Keyword Rankings' section. Check that this is the expected Semrush report.")
@@ -423,39 +441,57 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
     )
     expected = int(total_match.group(1)) if total_match else None
 
-    header_noise_re = re.compile(
+    page_break_re = re.compile(
         r"^(?:"
-        r"(?:Keyword\s+Rankings\s*)?(?:\d+\s*-\s*\d+\s*\(\d+\)|\d+\s+\d+\s+\d+)?"
-        r"|Keyword(?:\s+SERP\s+Features)?(?:\s+KD%)?"
-        r"|SERP\s+Features(?:\s+KD%)?"
-        r"|(?:Position|Diff|URL|KD%|CPC|Volume)(?:\s+(?:Position|Diff|URL|KD%|CPC|Volume))*"
-        r"|800\s+BOYLSTON\s+STREET.*"
+        r"800\s+BOYLSTON\s+STREET.*"
         r"|WWW\.SEMRUSH\.COM.*"
         r"|Generated\s+on\s+.*"
         r"|.*The\s+report\s+data\s+is\s+taken\s+from\s+Semrush.*"
         r")$",
         re.I,
     )
+    header_noise_re = re.compile(
+        r"^(?:"
+        r"(?:Keyword\s+Rankings\s*)?(?:\d+\s*-\s*\d+\s*\(\d+\)|\d+\s+\d+\s+\d+)?"
+        r"|Keyword(?:\s+SERP\s+Features)?(?:\s+KD%)?"
+        r"|SERP\s+Features(?:\s+KD%)?"
+        r"|(?:Position|Diff|URL|KD%|CPC|Volume)(?:\s+(?:Position|Diff|URL|KD%|CPC|Volume))*"
+        r")$",
+        re.I,
+    )
 
     entries: list[dict] = []
     current = None
+    in_page_break = False
     for line in (clean_text(line) for line in section.splitlines()):
         if not line:
             continue
         if re.match(r"^\d+\.\s+\S", line):
             current = {"name_parts": [re.sub(r"^\d+\.\s+", "", line)], "values": [], "finished_name": False}
             entries.append(current)
+            in_page_break = False
         elif current is None:
             continue
-        elif re.match(r"^\d+(?:st|nd|rd|th)\s+time$", line, re.I) or header_noise_re.match(line):
+        elif page_break_re.match(line):
             current["finished_name"] = True
+            in_page_break = True
+            continue
+        elif header_noise_re.match(line):
+            current["finished_name"] = True
+            in_page_break = False
+            continue
+        elif re.match(r"^\d+(?:st|nd|rd|th)\s+time$", line, re.I):
+            current["finished_name"] = True
+            in_page_break = False
             continue
         else:
             tokens = line.replace("\x00", "+").split()
             if tokens and all(re.fullmatch(VALUE_RE, t, re.I) for t in tokens):
-                # Ignore standalone page numbers when values haven't started or are already complete
-                if len(tokens) == 1 and (not current["values"] or len(current["values"]) >= 4):
+                # Ignore a standalone page number right after a page footer/header or after values are complete
+                if len(tokens) == 1 and (in_page_break or len(current["values"]) >= 5):
+                    in_page_break = False
                     continue
+                in_page_break = False
                 if len(current["values"]) < 6:
                     current["values"].extend(tokens)
                     current["finished_name"] = True
@@ -778,26 +814,8 @@ def insights(tracked: list[dict]) -> str:
     return base
 
 
-def _decode_semrush_pua(text: str) -> str:
-    out = []
-    for ch in text or "":
-        code = ord(ch)
-        if 0xE071 <= code <= 0xE07A:
-            out.append(chr(ord("0") + (code - 0xE071)))
-        elif ch == "\x00":
-            out.append("-")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
 def parse_site_audit(reader: PdfReader, pdf_path: Path | None = None) -> dict | None:
-    if pymupdf is not None and pdf_path is not None:
-        raw_pages = [page.get_text() for page in pymupdf.open(str(pdf_path))]
-    else:
-        raw_pages = [(p.extract_text() or "") for p in reader.pages]
-
-    pages = [_decode_semrush_pua(t) for t in raw_pages]
+    pages = _extract_pdf_pages(reader, pdf_path)
     full_doc = "\n".join(pages)
     url_match = re.search(r"https?://[^\s|)\x00]+", full_doc)
     audited_url = url_match.group(0).rstrip(".,;)") if url_match else ""
