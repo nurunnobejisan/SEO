@@ -366,11 +366,6 @@ def crawl_target_website(
             except Exception:
                 pass
 
-    # If the live HTTP request was blocked by WAF (crawled_pages == 0) and workbook URLs match target_url's domain,
-    # include the indexed workbook keywords for that target domain as proven website content
-    if crawled_pages == 0 and workbook_keywords:
-        collected_chunks.extend(workbook_keywords)
-
     if fallback_text:
         collected_chunks.append(fallback_text)
 
@@ -1572,27 +1567,11 @@ def build(
         try:
             tracked = parse_tracked_keywords(reader, pdf)
             used_pdf_tracked = True
-            if allowed_services:
-                matched_tracked = [
-                    item
-                    for item in tracked
-                    if keyword_matches_services(
-                        item["name"],
-                        allowed_services,
-                        workbook_keywords=wb_profile["keywords"],
-                        require_workbook_match=True,
-                    )
-                ]
-                if matched_tracked:
-                    tracked = matched_tracked
-                else:
-                    tracked = tracked_from_xlsx(xlsx, name, allowed_services=allowed_services)
-                    used_pdf_tracked = False
         except Exception as exc:
             print(f"Warning: PDF keyword parsing failed ({exc}); falling back to Excel.", file=sys.stderr)
-            tracked = tracked_from_xlsx(xlsx, name, allowed_services=allowed_services)
+            tracked = tracked_from_xlsx(xlsx, name)
     else:
-        tracked = tracked_from_xlsx(xlsx, name, allowed_services=allowed_services)
+        tracked = tracked_from_xlsx(xlsx, name)
 
     ancillary, keyword_column = keyword_rows(
         xlsx,
