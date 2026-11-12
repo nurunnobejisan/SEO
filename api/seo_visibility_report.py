@@ -1418,13 +1418,36 @@ def _strip_highlights_and_spacing(shape) -> None:
                 parent.remove(el)
 
 
+def _describe_issue_impact(issue_text: str) -> str | None:
+    low = issue_text.lower()
+    if "broken" in low and "image" in low:
+        return "broken internal images trigger dead requests and hurt visual UX"
+    if "broken" in low or "4xx" in low or "5xx" in low:
+        return "broken links block crawlers and leak ranking authority"
+    if "hreflang" in low:
+        return "invalid hreflang links split regional indexing signals"
+    if "javascript" in low or "css" in low or "speed" in low or "size" in low:
+        return "oversized JS/CSS files slow load times and lower Core Web Vitals"
+    if "title" in low:
+        return "overlong title tags get cut off in Google SERPs and reduce click-through rates (CTR)"
+    if "alt" in low:
+        return "missing image alt tags reduce ADA compliance and Google Image visibility"
+    if "h1" in low or "<h" in low or "heading" in low:
+        return "missing <h> headings weaken topical relevance for target keywords"
+    if "meta description" in low:
+        return "missing meta descriptions lower organic SERP click-through rates"
+    if "text-html" in low or "word count" in low:
+        return "low text-to-HTML ratios signal thin content to search engines"
+    return None
+
+
 def populate_seo_errors_slide(
     errors_slide,
     audit: dict | None,
     full_list_url: str = "",
     pdf_path: Path | None = None,
 ) -> None:
-    """Populate Slide 5 (SEO Errors Report) with the follow-up note, Top Issues screenshot, and client summary."""
+    """Populate Slide 5 (SEO Errors Report) with the follow-up note, Top Issues screenshot, and SEO expert issue/impact analysis."""
     note_text = (
         "NOTE FOR SEO TEAM:  This slide only applies to stand-alone sites for soft brands or independents.  "
         "Remove this slide for brand hotels."
@@ -1434,26 +1457,51 @@ def populate_seo_errors_slide(
         err_cnt = audit["errors"]
         warn_cnt = audit["warnings"]
         health = audit["site_health"]
-        health_line = (
-            f"Site Health is currently at {health} with {err_cnt} Errors and {warn_cnt} Warnings identified."
-            if health and health != "N/A"
-            else f"The current audit identified {err_cnt} Errors and {warn_cnt} Warnings."
-        )
-    else:
-        health_line = "Our technical SEO audit monitors site health across all crawled pages for Errors and Warnings."
+        top_issues = audit.get("top_issues", [])
+        error_items = [i["issue"] for i in top_issues if i.get("status", "").lower() == "error"]
+        warn_items = [i["issue"] for i in top_issues if i.get("status", "").lower() == "warning"]
 
-    para1_text = (
-        f"{health_line} “Errors” are high-priority technical issues (such as broken images or incorrect hreflang "
-        f"links) that directly impact search engine crawlability and indexation, while “Warnings” are on-page "
-        f"items (such as missing alt or <h> tags, lengthy title tags, or large JS/CSS files) that affect page "
-        f"speed and keyword relevance."
-    )
-    para2_text = (
-        "What We Fix & Impact: For hosted sites, our SEO team directly resolves all technical errors and "
-        "warnings—including adding missing <h> headings and image alt attributes—to improve crawl efficiency and "
-        "rankings. When a warning requires new page copy or applies to an externally hosted site (such as low "
-        "text-to-HTML ratio or code compression), our Account Manager coordinates directly with the site host."
-    )
+        err_summary = f" ({'; '.join(error_items[:2])})" if error_items else ""
+        warn_summary = f" ({'; '.join(warn_items[:3])})" if warn_items else ""
+
+        specific_impacts = []
+        for item in top_issues:
+            imp = _describe_issue_impact(item.get("issue", ""))
+            if imp and imp not in specific_impacts:
+                specific_impacts.append(imp)
+
+        health_prefix = f"Site Health is {health}: " if health and health != "N/A" else ""
+        para1_text = (
+            f"Technical SEO Issues ({err_cnt} Errors, {warn_cnt} Warnings): {health_prefix}"
+            f"Identified {err_cnt} critical Errors{err_summary} and {warn_cnt} Warnings{warn_summary}. "
+            f"“Errors” are severe crawl and indexing blockers, while “Warnings” flag on-page speed and metadata gaps."
+        )
+
+        if specific_impacts:
+            impact_detail = "; ".join(specific_impacts[:4])
+            para2_text = (
+                f"Impact If Left Unresolved: Without remediation, {impact_detail}. "
+                f"Over time, leaving these technical defects unfixed wastes Google crawl budget, suppresses Page 1 "
+                f"keyword rankings, and reduces qualified organic traffic and direct bookings."
+            )
+        else:
+            para2_text = (
+                "Impact If Left Unresolved: Leaving technical Errors and Warnings unaddressed wastes search engine "
+                "crawl budget, degrades Core Web Vitals and page speed, weakens keyword authority, and leads to "
+                "lower Page 1 rankings and lost direct booking traffic."
+            )
+    else:
+        para1_text = (
+            "Technical SEO Issues (Errors & Warnings): “Errors” are critical technical blockers (broken images/links, "
+            "server errors, or invalid hreflang tags) that prevent proper crawling and indexing, while “Warnings” "
+            "flag on-page gaps (heavy JS/CSS, lengthy title tags, or missing <h> and alt tags)."
+        )
+        para2_text = (
+            "Impact If Left Unresolved: If these issues are not fixed, search engine crawlers waste crawl budget on "
+            "broken assets, Core Web Vitals and page load speeds drop, and key pages lose ranking signals—resulting "
+            "in lower Page 1 visibility, reduced organic click-through rates, and lost direct bookings."
+        )
+
     report_url = full_list_url or (audit.get("audited_url", "") if audit else "")
 
     for shape in list(errors_slide.shapes):
