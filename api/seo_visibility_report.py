@@ -19,6 +19,8 @@ import copy
 import io
 import re
 import sys
+import urllib.parse
+import urllib.request
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -149,6 +151,269 @@ CONNECTORS = {
 MIN_SEARCH_VOLUME = 30
 MAX_TRACKED_KEYWORDS = 10  # Capped at 10 as requested
 MAX_ANCILLARY_KEYWORDS = 10  # Capped at 10 as requested
+
+SERVICE_PATTERNS: dict[str, str] = {
+    "lodging": r"\b(?:hotels?|inns?|motels?|lodging|stays?|places\s+to\s+stay|rooms?)\b",
+    "accommodations": r"\b(?:accommodations?)\b",
+    "resort": r"\b(?:resorts?|retreats?|getaways?)\b",
+    "spa": r"\b(?:spas?|massages?|facials?|saunas?|wellness|day\s+spas?)\b",
+    "pool": r"\b(?:pools?|swim(?:ming)?|waterparks?|lazy\s+river)\b",
+    "hot_tub": r"\b(?:jacuzzis?|hot\s+tubs?|whirlpools?)\b",
+    "suites": r"\b(?:suites?|extended\s+stay|kitchenettes?)\b",
+    "boutique": r"\b(?:boutique)\b",
+    "luxury": r"\b(?:luxury|luxurious|5\s+star|five\s+star|4\s+star|four\s+star|upscale)\b",
+    "pet_friendly": r"\b(?:pets?|pet\s+friendly|dogs?|dog\s+friendly)\b",
+    "wedding": r"\b(?:weddings?|bridal|ceremon(?:y|ies)|receptions?)\b",
+    "meetings_events": r"\b(?:meetings?|conferences?|conventions?|ballrooms?|banquets?|events?)\b",
+    "venues": r"\b(?:venues?)\b",
+    "dining": r"\b(?:restaurants?|dining|bistros?|steakhouses?)\b",
+    "breakfast": r"\b(?:breakfast|brunch)\b",
+    "things_to_do": r"\b(?:things?\s+to\s+do|attractions?|activities|sightseeing)\b",
+    "waterfront": r"\b(?:waterfront|riverfront|riverwalk|beachfront|oceanfront|lakefront|lakeside)\b",
+    "golf": r"\b(?:golf(?:ing)?)\b",
+    "casino": r"\b(?:casinos?|gaming|slots?)\b",
+    "ski": r"\b(?:ski(?:ing)?|snowboard(?:ing)?)\b",
+    "all_inclusive": r"\b(?:all[\s\-]+inclusive)\b",
+    "family": r"\b(?:famil(?:y|ies)|kids?)\b",
+    "romantic": r"\b(?:romantic|couples?|honeymoon)\b",
+    "packages_deals": r"\b(?:packages?|deals?|specials?|offers?|discounts?)\b",
+}
+
+SERVICE_LABELS: dict[str, str] = {
+    "lodging": "Hotel & Lodging",
+    "accommodations": "Accommodations",
+    "resort": "Resort & Getaways",
+    "spa": "Spa & Wellness",
+    "pool": "Pool & Aquatics",
+    "hot_tub": "Hot Tub / Jacuzzi",
+    "suites": "Suites",
+    "boutique": "Boutique Hotel",
+    "luxury": "Luxury / Upscale",
+    "pet_friendly": "Pet-Friendly",
+    "wedding": "Weddings",
+    "meetings_events": "Meetings & Events",
+    "venues": "Event Venues",
+    "dining": "Restaurants & Dining",
+    "breakfast": "Breakfast",
+    "things_to_do": "Local Attractions / Things to Do",
+    "waterfront": "Waterfront / Riverfront",
+    "golf": "Golf",
+    "casino": "Casino",
+    "ski": "Ski",
+    "all_inclusive": "All-Inclusive",
+    "family": "Family-Friendly",
+    "romantic": "Romantic / Couples",
+    "packages_deals": "Packages & Deals",
+}
+
+
+def detect_services_in_text(text: str) -> set[str]:
+    cleaned = re.sub(r"[^a-z0-9\s\-]", " ", (text or "").lower())
+    found: set[str] = set()
+    for svc, pat in SERVICE_PATTERNS.items():
+        if re.search(pat, cleaned, re.I):
+            found.add(svc)
+    return found
+
+
+def extract_workbook_profile(xlsx_path: Path) -> dict:
+    """Extract the services, ranked keywords, and primary URL from the Keywords Workbook."""
+    try:
+        frame = pd.read_excel(xlsx_path)
+    except Exception:
+        return {"services": set(), "keywords": [], "primary_url": "", "urls": []}
+    if frame.empty:
+        return {"services": set(), "keywords": [], "primary_url": "", "urls": []}
+    frame.columns = [str(c).strip() for c in frame.columns]
+    kw_cols = [c for c in frame.columns if any(w in c.lower() for w in ("keyword", "query", "search term"))]
+    pos_cols = [c for c in frame.columns if any(w in c.lower() for w in ("position", "rank"))]
+    url_cols = [c for c in frame.columns if c.lower() in ("url", "landing page", "page url")]
+
+    if kw_cols and pos_cols:
+        kw_col, pos_col = kw_cols[0], pos_cols[0]
+        frame["_kw"] = frame[kw_col].fillna("").astype(str).str.strip()
+        frame["_pos"] = pd.to_numeric(frame[pos_col], errors="coerce")
+        valid = frame[(frame["_kw"] != "") & frame["_pos"].notna()]
+        keywords = valid["_kw"].tolist()
+    elif kw_cols:
+        keywords = frame[kw_cols[0]].fillna("").astype(str).str.strip().tolist()
+    else:
+        keywords = []
+
+    urls: list[str] = []
+    primary_url = ""
+    if url_cols:
+        raw_urls = frame[url_cols[0]].dropna().astype(str).str.strip().tolist()
+        urls = [u for u in raw_urls if u.startswith("http")]
+        if urls:
+            # Strip query strings for the cleanest canonical target URL
+            clean_urls = [u.split("?")[0] for u in urls]
+            primary_url = pd.Series(clean_urls).mode().iloc[0] if clean_urls else urls[0]
+
+    combined_kw_text = "\n".join(keywords)
+    wb_services = detect_services_in_text(combined_kw_text)
+    return {
+        "services": wb_services,
+        "keywords": keywords,
+        "primary_url": primary_url,
+        "urls": urls,
+    }
+
+
+def _fetch_html(url: str, timeout: float = 5.0) -> tuple[str, str]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(600_000).decode("utf-8", errors="ignore")
+        return raw, resp.geturl()
+
+
+def _html_to_crawl_text(html: str) -> tuple[str, str]:
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    title = clean_text(re.sub(r"<[^>]+>", " ", title_m.group(1))) if title_m else ""
+    meta_parts = re.findall(
+        r'<meta[^>]+(?:name|property)=["\'](?:description|og:title|og:description|keywords)["\'][^>]+content=["\']([^"\']+)["\']',
+        html,
+        re.I,
+    )
+    meta_parts += re.findall(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:name|property)=["\'](?:description|og:title|og:description|keywords)["\']',
+        html,
+        re.I,
+    )
+    cleaned_html = re.sub(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
+    visible = clean_text(re.sub(r"<[^>]+>", " ", cleaned_html))
+    return title, " ".join([title] + meta_parts + [visible])
+
+
+def crawl_target_website(
+    target_url: str,
+    fallback_text: str = "",
+    workbook_urls: list[str] | None = None,
+    workbook_keywords: list[str] | None = None,
+) -> dict:
+    """Crawl the target hotel website (and key service subpages) to identify supported services."""
+    url = (target_url or "").strip()
+    if url and not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+
+    crawled_pages = 0
+    page_title = ""
+    collected_chunks: list[str] = []
+
+    if url:
+        # Always include the URL path slugs themselves (e.g., 'renaissance-shoals-resort-and-spa')
+        parsed = urllib.parse.urlparse(url)
+        slug_text = re.sub(r"[^a-z0-9]+", " ", parsed.path.lower())
+        collected_chunks.append(slug_text)
+
+        try:
+            html, final_url = _fetch_html(url, timeout=5.0)
+            if "access denied" not in html.lower()[:600]:
+                t, txt = _html_to_crawl_text(html)
+                page_title = t
+                collected_chunks.append(txt)
+                crawled_pages += 1
+
+                # Discover up to 3 internal service links on the same domain
+                base_netloc = urllib.parse.urlparse(final_url).netloc.lower()
+                hrefs = re.findall(r'href=["\']([^"\'#]+)["\']', html, re.I)
+                sub_candidates: list[str] = []
+                service_slug_re = re.compile(
+                    r"(?:amenit|spa|dining|restaurant|meeting|wedding|event|room|suite|pool|accommodat|overview|experience)",
+                    re.I,
+                )
+                for h in hrefs:
+                    full_u = urllib.parse.urljoin(final_url, h).split("?")[0].rstrip("/")
+                    u_parsed = urllib.parse.urlparse(full_u)
+                    if (
+                        u_parsed.scheme in ("http", "https")
+                        and u_parsed.netloc.lower() == base_netloc
+                        and full_u != final_url.rstrip("/")
+                        and service_slug_re.search(u_parsed.path)
+                        and not re.search(r"\.(?:pdf|jpg|jpeg|png|gif|webp|css|js)$", u_parsed.path, re.I)
+                        and full_u not in sub_candidates
+                    ):
+                        sub_candidates.append(full_u)
+                        collected_chunks.append(re.sub(r"[^a-z0-9]+", " ", u_parsed.path.lower()))
+
+                for sub_url in sub_candidates[:3]:
+                    try:
+                        sub_html, _ = _fetch_html(sub_url, timeout=3.5)
+                        if "access denied" not in sub_html.lower()[:600]:
+                            _, sub_txt = _html_to_crawl_text(sub_html)
+                            collected_chunks.append(sub_txt)
+                            crawled_pages += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    if workbook_urls:
+        for wu in workbook_urls[:100]:
+            try:
+                p_path = urllib.parse.urlparse(wu).path.lower()
+                collected_chunks.append(re.sub(r"[^a-z0-9]+", " ", p_path))
+            except Exception:
+                pass
+
+    # If the live HTTP request was blocked by WAF (crawled_pages == 0) and workbook URLs match target_url's domain,
+    # include the indexed workbook keywords for that target domain as proven website content
+    if crawled_pages == 0 and workbook_keywords:
+        collected_chunks.extend(workbook_keywords)
+
+    if fallback_text:
+        collected_chunks.append(fallback_text)
+
+    combined = "\n".join(collected_chunks)
+    website_services = detect_services_in_text(combined)
+    if url or combined.strip():
+        website_services.add("lodging")
+
+    return {
+        "target_url": url,
+        "page_title": page_title,
+        "crawled_pages": crawled_pages,
+        "services": website_services,
+    }
+
+
+def keyword_matches_services(
+    keyword: str,
+    allowed_services: set[str],
+    workbook_keywords: list[str] | None = None,
+    require_workbook_match: bool = False,
+) -> bool:
+    """Return True if all services referenced in `keyword` match `allowed_services` (website ∩ workbook)."""
+    kw_clean = re.sub(r"[^a-z0-9\s\-]", " ", keyword.lower()).strip()
+    kw_services = detect_services_in_text(kw_clean)
+
+    # If the keyword mentions any service category, every mentioned service must be supported
+    if kw_services:
+        if not kw_services.issubset(allowed_services):
+            return False
+    elif require_workbook_match:
+        return False
+
+    if require_workbook_match and workbook_keywords:
+        wb_norm = {re.sub(r"\s+", " ", k.lower()).strip() for k in workbook_keywords}
+        if kw_clean in wb_norm:
+            return True
+        # Check if any workbook keyword shares the same service category in the workbook
+        wb_services_all = detect_services_in_text("\n".join(workbook_keywords))
+        if not kw_services.issubset(wb_services_all):
+            return False
+
+    return True
 
 
 def choose_file(explicit: str | None, suffix: str, role: str, optional: bool = False) -> Path | None:
@@ -548,7 +813,11 @@ def parse_tracked_keywords(reader: PdfReader, pdf_path: Path | None = None) -> l
     return result
 
 
-def tracked_from_xlsx(xlsx_path: Path, prop_name: str = "") -> list[dict]:
+def tracked_from_xlsx(
+    xlsx_path: Path,
+    prop_name: str = "",
+    allowed_services: set[str] | None = None,
+) -> list[dict]:
     frame = pd.read_excel(xlsx_path)
     frame.columns = [str(c).strip() for c in frame.columns]
     keyword_cols = [c for c in frame.columns if any(x in c.lower() for x in ("keyword", "query", "search term"))]
@@ -568,6 +837,12 @@ def tracked_from_xlsx(xlsx_path: Path, prop_name: str = "") -> list[dict]:
         ]
         if not non_branded.empty:
             frame = non_branded
+    if allowed_services:
+        svc_matched = frame[
+            frame["_kw"].apply(lambda kw: keyword_matches_services(kw, allowed_services))
+        ]
+        if not svc_matched.empty:
+            frame = svc_matched
     frame = frame.head(MAX_TRACKED_KEYWORDS)
     if frame.empty:
         raise ValueError("No keyword rows with a numeric position were found in the Excel file.")
@@ -579,6 +854,7 @@ def keyword_rows(
     tracked: list[dict],
     prop_name: str = "",
     from_pdf: bool = True,
+    allowed_services: set[str] | None = None,
 ) -> tuple[list[dict], str]:
     try:
         frame = pd.read_excel(xlsx_path)
@@ -649,6 +925,13 @@ def keyword_rows(
         frame = pd.concat([strict_frame, fallback_frame]).drop_duplicates("_normalized")
     else:
         frame = strict_frame
+
+    if allowed_services:
+        svc_filtered = frame[
+            frame["_keyword"].apply(lambda kw: keyword_matches_services(kw, allowed_services))
+        ]
+        if not svc_filtered.empty:
+            frame = svc_filtered
 
     # Select diverse location-based keywords (capping identical topic stems at 2 so 'near' & diverse terms appear)
     candidates = []
@@ -1241,9 +1524,18 @@ def populate_seo_errors_slide(
         errors_slide.shapes.add_picture(io.BytesIO(png_bytes), left, top, width=width, height=new_height)
 
 
-def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_url: str = "") -> None:
+def build(
+    template: Path,
+    pdf: Path | None,
+    xlsx: Path,
+    output: Path,
+    full_list_url: str = "",
+    target_url: str = "",
+) -> None:
     audit_data = None
     used_pdf_tracked = False
+    wb_profile = extract_workbook_profile(xlsx)
+
     if pdf:
         reader = PdfReader(str(pdf))
         try:
@@ -1251,20 +1543,64 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
         except Exception:
             name = property_name_from_xlsx(xlsx)
         try:
-            tracked = parse_tracked_keywords(reader, pdf)
-            used_pdf_tracked = True
-        except Exception as exc:
-            print(f"Warning: PDF keyword parsing failed ({exc}); falling back to Excel.", file=sys.stderr)
-            tracked = tracked_from_xlsx(xlsx, name)
-        try:
             audit_data = parse_site_audit(reader, pdf)
         except Exception as exc:
             print(f"Warning: PDF Site Audit parsing failed ({exc}).", file=sys.stderr)
             audit_data = None
     else:
         name = property_name_from_xlsx(xlsx)
-        tracked = tracked_from_xlsx(xlsx, name)
-    ancillary, keyword_column = keyword_rows(xlsx, tracked, name, from_pdf=used_pdf_tracked)
+
+    effective_target_url = (
+        (target_url or "").strip()
+        or (audit_data.get("audited_url", "") if audit_data else "")
+        or wb_profile.get("primary_url", "")
+    )
+    crawl_info = crawl_target_website(
+        effective_target_url,
+        fallback_text=name,
+        workbook_urls=wb_profile.get("urls"),
+        workbook_keywords=wb_profile.get("keywords"),
+    )
+    if crawl_info["services"] and wb_profile["services"]:
+        allowed_services = crawl_info["services"] & wb_profile["services"]
+        if "lodging" in wb_profile["services"]:
+            allowed_services.add("lodging")
+    else:
+        allowed_services = wb_profile["services"] or crawl_info["services"]
+
+    if pdf:
+        try:
+            tracked = parse_tracked_keywords(reader, pdf)
+            used_pdf_tracked = True
+            if allowed_services:
+                matched_tracked = [
+                    item
+                    for item in tracked
+                    if keyword_matches_services(
+                        item["name"],
+                        allowed_services,
+                        workbook_keywords=wb_profile["keywords"],
+                        require_workbook_match=True,
+                    )
+                ]
+                if matched_tracked:
+                    tracked = matched_tracked
+                else:
+                    tracked = tracked_from_xlsx(xlsx, name, allowed_services=allowed_services)
+                    used_pdf_tracked = False
+        except Exception as exc:
+            print(f"Warning: PDF keyword parsing failed ({exc}); falling back to Excel.", file=sys.stderr)
+            tracked = tracked_from_xlsx(xlsx, name, allowed_services=allowed_services)
+    else:
+        tracked = tracked_from_xlsx(xlsx, name, allowed_services=allowed_services)
+
+    ancillary, keyword_column = keyword_rows(
+        xlsx,
+        tracked,
+        name,
+        from_pdf=used_pdf_tracked,
+        allowed_services=allowed_services,
+    )
 
     prs = Presentation(str(template))
     if len(prs.slides) < 4:
@@ -1360,6 +1696,7 @@ def main() -> None:
     parser.add_argument("--xlsx", help="Keyword list (.xlsx)")
     parser.add_argument("--output", help="Output .pptx path (default: report name in current folder)")
     parser.add_argument("--full-list-url", default="", help="Optional URL for the Full Keyword List link on slide 4")
+    parser.add_argument("--target-url", default="", help="Optional Target Website URL to crawl and match services against the Keywords Workbook")
     args = parser.parse_args()
     try:
         template = choose_file(args.template, ".pptx", "PowerPoint template", optional=True)
@@ -1379,7 +1716,7 @@ def main() -> None:
         name = property_name(PdfReader(str(pdf)), pdf) if pdf else property_name_from_xlsx(xlsx)
         safe_name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .") or "SEO Report"
         output = Path(args.output).expanduser() if args.output else Path.cwd() / f"Monthly SEO Visibility Analysis - {safe_name}.pptx"
-        build(template, pdf, xlsx, output, args.full_list_url)
+        build(template, pdf, xlsx, output, args.full_list_url, target_url=args.target_url)
         if Path("/content").is_dir() or "google.colab" in sys.modules:
             from google.colab import files
             files.download(str(output))

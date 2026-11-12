@@ -92,11 +92,36 @@
             const [template, setTemplate] = useState(null);
             const [xlsx, setXlsx] = useState(null);
             const [pdf, setPdf] = useState(null);
+            const [targetUrl, setTargetUrl] = useState("");
+            const [crawlLoading, setCrawlLoading] = useState(false);
+            const [crawlResult, setCrawlResult] = useState(null);
             const [loading, setLoading] = useState(false);
             const [error, setError] = useState("");
             const [successMsg, setSuccessMsg] = useState("");
             useEffect(() => { lucide.createIcons(); });
             const readyCount = (template ? 1 : 0) + (xlsx ? 1 : 0);
+
+            const handleCrawl = async () => {
+                if (!targetUrl.trim() && !xlsx) {
+                    setError("Please enter a Target Website URL or upload the Keywords Workbook (.xlsx) first.");
+                    return;
+                }
+                setError(""); setCrawlLoading(true);
+                const formData = new FormData();
+                if (targetUrl.trim()) formData.append("target_url", targetUrl.trim());
+                if (xlsx) formData.append("xlsx", xlsx);
+                try {
+                    const response = await fetch("/crawl", { method: "POST", body: formData });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.error || "Failed to crawl target website.");
+                    setCrawlResult(data);
+                    if (!targetUrl.trim() && data.target_url) setTargetUrl(data.target_url);
+                } catch (err) {
+                    setError(err.message);
+                } finally {
+                    setCrawlLoading(false);
+                }
+            };
 
             const handleGenerate = async () => {
                 if (!template || !xlsx) {
@@ -107,6 +132,7 @@
                 const formData = new FormData();
                 formData.append("template", template); formData.append("xlsx", xlsx);
                 if (pdf) formData.append("pdf", pdf);
+                if (targetUrl.trim()) formData.append("target_url", targetUrl.trim());
 
                 try {
                     const response = await fetch(API_ENDPOINT, { method: "POST", body: formData });
@@ -164,10 +190,74 @@
                             </div>
                             {error && (<div className="flex items-start gap-3 bg-rose-50 border border-rose-200 p-4 mb-6 text-rose-800 rounded-2xl"><i data-lucide="alert-circle" className="w-5 h-5 text-rose-600 shrink-0 mt-0.5"></i><div className="text-sm font-medium">{error}</div></div>)}
                             {successMsg && (<div className="flex items-start gap-3 bg-brand-50 border border-brand/30 p-4 mb-6 text-slate-800 rounded-2xl"><i data-lucide="check-circle" className="w-5 h-5 text-brand-dark shrink-0 mt-0.5"></i><div className="text-sm font-semibold">{successMsg}</div></div>)}
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
                                 <FileUploadZone id="template" step={1} label="PowerPoint Template" subtitle="Master slide deck" accept=".pptx" badgeColor="bg-orange-50 text-orange-600 border border-orange-100" icon="presentation" required={true} file={template} setFile={setTemplate} />
                                 <FileUploadZone id="xlsx" step={2} label="Keywords Workbook" subtitle="Excel export" accept=".xlsx" badgeColor="bg-emerald-50 text-emerald-600 border border-emerald-100" icon="file-spreadsheet" required={true} file={xlsx} setFile={setXlsx} />
                                 <FileUploadZone id="pdf" step={3} label="Semrush Audit PDF" subtitle="Optional PDF report" accept=".pdf" badgeColor="bg-blue-50 text-blue-600 border border-blue-100" icon="file-text" required={false} file={pdf} setFile={setPdf} />
+                            </div>
+
+                            <div className="mb-8 p-6 rounded-2xl border-2 border-slate-200/80 bg-slate-50/70 transition-all">
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+                                    <div className="flex items-center gap-2.5">
+                                        <span className="text-xs font-display font-bold uppercase tracking-wider text-slate-400">Step 04</span>
+                                        <h3 className="font-display font-bold text-base text-slate-900">Target Website Crawl & Service Match</h3>
+                                    </div>
+                                    <span className="px-2.5 py-0.5 text-[11px] font-semibold rounded-full bg-purple-50 text-purple-700 border border-purple-200 w-fit">Service Verification</span>
+                                </div>
+                                <p className="text-xs text-slate-500 mb-4">
+                                    Enter the target property website URL to crawl its offerings and match services against your Keywords Workbook. Unmatched services are automatically excluded from the Keyword Position Summary.
+                                </p>
+                                <div className="flex flex-col sm:flex-row gap-3">
+                                    <div className="relative flex-grow">
+                                        <input
+                                            type="url"
+                                            value={targetUrl}
+                                            onChange={(e) => setTargetUrl(e.target.value)}
+                                            placeholder="https://www.marriott.com/en-us/hotels/... or https://www.propertywebsite.com"
+                                            className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-white text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-brand focus:ring-2 focus:ring-brand/20"
+                                        />
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={handleCrawl}
+                                        disabled={crawlLoading}
+                                        className={`px-5 py-3 rounded-xl font-display font-bold text-xs whitespace-nowrap transition-all flex items-center justify-center gap-2 border ${crawlLoading ? 'bg-slate-200 text-slate-400 border-slate-200 cursor-not-allowed' : 'bg-white text-slate-800 border-slate-300 hover:border-brand hover:bg-brand-50'}`}
+                                    >
+                                        <i data-lucide="globe" className="w-4 h-4"></i>
+                                        {crawlLoading ? "Crawling Website..." : "Crawl & Match Workbook"}
+                                    </button>
+                                </div>
+
+                                {crawlResult && (
+                                    <div className="mt-4 p-4 rounded-xl bg-white border border-slate-200/90 text-xs space-y-2.5">
+                                        <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
+                                            <span className="font-semibold text-slate-800 truncate max-w-xl" title={crawlResult.page_title}>
+                                                Target: {crawlResult.page_title}
+                                            </span>
+                                            <span className="text-[11px] font-medium text-slate-500">
+                                                {crawlResult.crawled_pages > 0 ? `${crawlResult.crawled_pages} page(s) crawled` : 'URL & Workbook profile analyzed'}
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span className="font-semibold text-emerald-700 block mb-1">Matched Services (Included in Keyword Position Summary):</span>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {(crawlResult.matched_services && crawlResult.matched_services.length > 0) ? crawlResult.matched_services.map((s, idx) => (
+                                                    <span key={idx} className="px-2.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium text-[11px]">{s}</span>
+                                                )) : <span className="text-slate-400">Upload Keywords Workbook to compare services</span>}
+                                            </div>
+                                        </div>
+                                        {crawlResult.unmatched_services && crawlResult.unmatched_services.length > 0 && (
+                                            <div>
+                                                <span className="font-semibold text-rose-600 block mb-1">Excluded Unmatched Services:</span>
+                                                <div className="flex flex-wrap gap-1.5">
+                                                    {crawlResult.unmatched_services.map((s, idx) => (
+                                                        <span key={idx} className="px-2.5 py-0.5 rounded-full bg-rose-50 text-rose-600 border border-rose-200 font-medium text-[11px]">{s}</span>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
                             </div>
                             <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-6 shadow-lg">
                                 <button onClick={handleGenerate} disabled={loading} className={`w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 rounded-xl font-display font-bold text-sm transition-all duration-300 ${loading ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-brand text-slate-900 hover:bg-brand-light shadow-glow hover:-translate-y-1 active:translate-y-0'}`}>

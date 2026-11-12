@@ -9,6 +9,10 @@
       "destination": "/api/index"
     },
     {
+      "source": "/crawl",
+      "destination": "/api/index"
+    },
+    {
       "source": "/upload",
       "destination": "/api/index"
     },

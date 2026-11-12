@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import shutil
 import tempfile
@@ -7,9 +9,23 @@ from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 
 try:
-    from .seo_visibility_report import build, property_name, property_name_from_xlsx
+    from .seo_visibility_report import (
+        SERVICE_LABELS,
+        build,
+        crawl_target_website,
+        extract_workbook_profile,
+        property_name,
+        property_name_from_xlsx,
+    )
 except ImportError:
-    from seo_visibility_report import build, property_name, property_name_from_xlsx
+    from seo_visibility_report import (
+        SERVICE_LABELS,
+        build,
+        crawl_target_website,
+        extract_workbook_profile,
+        property_name,
+        property_name_from_xlsx,
+    )
 from pypdf import PdfReader
 
 app = Flask(__name__)
@@ -33,7 +49,12 @@ def _file_signature(path: Path | None) -> str:
     return digest.hexdigest()
 
 
-def _cache_key(template_path: Path, xlsx_path: Path, pdf_path: Path | None = None) -> str:
+def _cache_key(
+    template_path: Path,
+    xlsx_path: Path,
+    pdf_path: Path | None = None,
+    target_url: str = "",
+) -> str:
     report_script = Path(__file__).resolve().parent / "seo_visibility_report.py"
     script_hash = hashlib.sha256(report_script.read_bytes()).hexdigest() if report_script.is_file() else "v11"
     payload = "|".join(
@@ -42,6 +63,7 @@ def _cache_key(template_path: Path, xlsx_path: Path, pdf_path: Path | None = Non
             _file_signature(template_path),
             _file_signature(xlsx_path),
             _file_signature(pdf_path),
+            (target_url or "").strip().lower(),
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -55,6 +77,58 @@ def home():
     return send_file('index.html')
 
 
+@app.route('/crawl', methods=['POST'])
+def crawl_website_endpoint():
+    temp_dir = None
+    try:
+        target_url = (request.form.get('target_url') or '').strip()
+        xlsx = request.files.get('xlsx')
+
+        wb_profile = {"services": set(), "keywords": [], "primary_url": "", "urls": []}
+        prop_title = ""
+        if xlsx and xlsx.filename:
+            temp_dir = tempfile.mkdtemp()
+            xlsx_path = Path(temp_dir) / xlsx.filename
+            xlsx.save(xlsx_path)
+            wb_profile = extract_workbook_profile(xlsx_path)
+            prop_title = property_name_from_xlsx(xlsx_path)
+
+        effective_url = target_url or wb_profile.get("primary_url", "")
+        if not effective_url:
+            return jsonify({"error": "Please enter a Target Website URL or upload a Keywords Workbook with a URL column."}), 400
+
+        crawl_info = crawl_target_website(
+            effective_url,
+            fallback_text=prop_title,
+            workbook_urls=wb_profile.get("urls"),
+            workbook_keywords=wb_profile.get("keywords"),
+        )
+        web_svcs = crawl_info["services"]
+        wb_svcs = wb_profile["services"]
+        matched_svcs = (web_svcs & wb_svcs) if wb_svcs else web_svcs
+        if "lodging" in wb_svcs:
+            matched_svcs.add("lodging")
+        unmatched_wb_svcs = (wb_svcs - web_svcs) if wb_svcs else set()
+
+        return jsonify(
+            {
+                "target_url": crawl_info["target_url"],
+                "page_title": crawl_info["page_title"] or prop_title or crawl_info["target_url"],
+                "crawled_pages": crawl_info["crawled_pages"],
+                "website_services": [SERVICE_LABELS.get(s, s) for s in sorted(web_svcs)],
+                "workbook_services": [SERVICE_LABELS.get(s, s) for s in sorted(wb_svcs)],
+                "matched_services": [SERVICE_LABELS.get(s, s) for s in sorted(matched_svcs)],
+                "unmatched_services": [SERVICE_LABELS.get(s, s) for s in sorted(unmatched_wb_svcs)],
+                "workbook_keyword_count": len(wb_profile["keywords"]),
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 @app.route('/generate', methods=['POST'])
 def generate_report():
     temp_dir = None
@@ -64,6 +138,7 @@ def generate_report():
         template = request.files.get('template')
         xlsx = request.files.get('xlsx')
         pdf = request.files.get('pdf')
+        target_url = (request.form.get('target_url') or '').strip()
 
         if not template or not xlsx:
             return jsonify({"error": "PowerPoint template and Excel file are required."}), 400
@@ -84,7 +159,7 @@ def generate_report():
             except Exception:
                 pass
 
-        cache_key = _cache_key(template_path, xlsx_path, pdf_path)
+        cache_key = _cache_key(template_path, xlsx_path, pdf_path, target_url=target_url)
         cached_path = CACHE_DIR / f"{cache_key}.pptx"
         download_name = _download_filename(name)
 
@@ -97,7 +172,7 @@ def generate_report():
             )
 
         output_path = cached_path
-        build(template_path, pdf_path, xlsx_path, output_path, full_list_url="")
+        build(template_path, pdf_path, xlsx_path, output_path, full_list_url="", target_url=target_url)
 
         response = send_file(
             output_path,
