@@ -947,12 +947,14 @@ def _load_pil_font(size: int, bold: bool = False):
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         ]
         if bold
         else [
             "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         ]
     )
     for path in candidates:
@@ -961,7 +963,57 @@ def _load_pil_font(size: int, bold: bool = False):
                 return ImageFont.truetype(path, size)
             except Exception:
                 pass
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def crop_top_issues_from_pdf(pdf_path: Path | None) -> tuple[bytes, int, int] | None:
+    """Crop the actual 'Top Issues' table directly from the Semrush PDF at 250 DPI using PyMuPDF."""
+    if pymupdf is None or pdf_path is None or not pdf_path.is_file():
+        return None
+    try:
+        doc = pymupdf.open(str(pdf_path))
+        strips: list[Image.Image] = []
+        started = False
+        for page in doc:
+            blocks = page.get_text("blocks")
+            if started and any("Backlinks" in b[4] for b in blocks if b[1] < 200):
+                break
+            hdr_block = next(
+                (b for b in blocks if "Top Issues" in b[4] and "Status Of Issues" in b[4]),
+                None,
+            )
+            if hdr_block is None:
+                continue
+            row_blocks = [b for b in blocks if b[1] > hdr_block[3] and b[3] < 805]
+            if not row_blocks:
+                continue
+            max_y = max(b[3] for b in row_blocks) + 9.0
+            if not started:
+                clip_top = hdr_block[1] - 8.5
+                started = True
+            else:
+                clip_top = hdr_block[3] + 7.5
+            rect = pymupdf.Rect(26.0, clip_top, 570.0, max_y)
+            pix = page.get_pixmap(dpi=250, clip=rect, alpha=False)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            strips.append(img)
+        if not strips:
+            return None
+        total_w = strips[0].width
+        total_h = sum(s.height for s in strips)
+        combined = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+        y = 0
+        for s in strips:
+            combined.paste(s, (0, y))
+            y += s.height
+        buf = io.BytesIO()
+        combined.save(buf, format="PNG")
+        return buf.getvalue(), total_w, total_h
+    except Exception:
+        return None
 
 
 def render_top_issues_image(top_issues: list[dict]) -> tuple[bytes, int, int]:
@@ -1079,8 +1131,22 @@ def ensure_seo_errors_slide(prs: Presentation):
     return new_slide
 
 
-def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: str = "") -> None:
-    """Populate Slide 5 (SEO Errors Report) with the follow-up note, Top Issues screenshot, and boilerplate summary."""
+def _strip_highlights_and_spacing(shape) -> None:
+    """Remove template yellow <a:highlight> markers and excessive paragraph spacing from a text shape."""
+    for el in list(shape._element.iter()):
+        if el.tag.endswith("}highlight") or el.tag.endswith("}spcBef") or el.tag.endswith("}spcAft"):
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
+
+
+def populate_seo_errors_slide(
+    errors_slide,
+    audit: dict | None,
+    full_list_url: str = "",
+    pdf_path: Path | None = None,
+) -> None:
+    """Populate Slide 5 (SEO Errors Report) with the follow-up note, Top Issues screenshot, and client summary."""
     note_text = (
         "NOTE FOR SEO TEAM:  This slide only applies to stand-alone sites for soft brands or independents.  "
         "Remove this slide for brand hotels."
@@ -1090,43 +1156,37 @@ def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: s
         err_cnt = audit["errors"]
         warn_cnt = audit["warnings"]
         health = audit["site_health"]
-        crawled = audit["crawled_pages"]
-        top_errors = [x["issue"] for x in audit["top_issues"] if x["status"].lower() == "error"]
-        top_warnings = [x["issue"] for x in audit["top_issues"] if x["status"].lower() == "warning"]
-
-        err_detail = f": {'; '.join(top_errors)}" if top_errors else ""
-        warn_detail = f", including: {'; '.join(top_warnings[:3])}" if top_warnings else ""
-        health_clause = f"Site Health is at {health} across {crawled} crawled pages. " if crawled else ""
-
-        explanation_text = (
-            f"{health_clause}“Errors” ({err_cnt} found{err_detail}) are critical technical issues that impact "
-            f"crawlability and indexation, while “Warnings” ({warn_cnt} found{warn_detail}) highlight on-page "
-            f"optimization opportunities.\n\n"
-            f"If we host the site, our team will fix all errors and warnings and report here once all are fixed, "
-            f"including adding missing <h> or alt tags. If a warning requires new copy to be written or is for a "
-            f"site we do not host (such as low text-HTML ratio, title tag length, or missing <h> tags), it will "
-            f"be for the AM to address with the site host."
+        health_line = (
+            f"Site Health is currently at {health} with {err_cnt} Errors and {warn_cnt} Warnings identified."
+            if health and health != "N/A"
+            else f"The current audit identified {err_cnt} Errors and {warn_cnt} Warnings."
         )
-        report_url = full_list_url or audit.get("audited_url", "")
     else:
-        explanation_text = (
-            "“Errors” represent critical technical SEO issues that prevent search engines from properly crawling "
-            "or indexing site pages, while “Warnings” highlight lower-priority on-page optimization opportunities.\n\n"
-            "If we host the site, our team will fix all errors and warnings and report here once all are fixed, "
-            "including adding missing <h> tags if any are missing. If a warning requires new copy to be written "
-            "or is for a site we do not host (such as low text-HTML ratio or missing <h> tags), it will be for "
-            "the AM to address with the site host."
-        )
-        report_url = full_list_url
+        health_line = "Our technical SEO audit monitors site health across all crawled pages for Errors and Warnings."
+
+    para1_text = (
+        f"{health_line} “Errors” are high-priority technical issues (such as broken images or incorrect hreflang "
+        f"links) that directly impact search engine crawlability and indexation, while “Warnings” are on-page "
+        f"items (such as missing alt or <h> tags, lengthy title tags, or large JS/CSS files) that affect page "
+        f"speed and keyword relevance."
+    )
+    para2_text = (
+        "What We Fix & Impact: For hosted sites, our SEO team directly resolves all technical errors and "
+        "warnings—including adding missing <h> headings and image alt attributes—to improve crawl efficiency and "
+        "rankings. When a warning requires new page copy or applies to an externally hosted site (such as low "
+        "text-to-HTML ratio or code compression), our Account Manager coordinates directly with the site host."
+    )
+    report_url = full_list_url or (audit.get("audited_url", "") if audit else "")
 
     for shape in list(errors_slide.shapes):
         if shape.has_text_frame:
             txt_lower = shape.text.lower()
             if "note for seo team" in txt_lower:
+                _strip_highlights_and_spacing(shape)
                 set_paragraph_text(shape.text_frame.paragraphs[0], note_text)
                 if shape.text_frame.paragraphs[0].runs:
                     shape.text_frame.paragraphs[0].runs[0].font.name = "Source Sans Pro"
-                    shape.text_frame.paragraphs[0].runs[0].font.size = Pt(11)
+                    shape.text_frame.paragraphs[0].runs[0].font.size = Pt(10.5)
             elif "boilerplate" in txt_lower or ("errors" in txt_lower and "warnings" in txt_lower and "seo team" in txt_lower):
                 for i in range(len(shape.text_frame.paragraphs) - 1, 0, -1):
                     p = shape.text_frame.paragraphs[i]
@@ -1136,7 +1196,8 @@ def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: s
                 for child in list(p0._p):
                     if child.tag.endswith("}br"):
                         p0._p.remove(child)
-                set_paragraph_text(p0, explanation_text)
+                set_paragraph_text(p0, f"{para1_text}\n\n{para2_text}")
+                _strip_highlights_and_spacing(shape)
                 if p0.runs:
                     p0.runs[0].font.name = "Source Sans Pro"
                     p0.runs[0].font.size = Pt(9)
@@ -1148,6 +1209,7 @@ def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: s
                 link_run.font.name = "Source Sans Pro"
                 link_run.font.size = Pt(9)
                 link_run.font.bold = True
+                link_run.font.color.rgb = RGBColor(0x4B, 0x28, 0x82)
                 if report_url:
                     link_run.hyperlink.address = report_url
 
@@ -1157,13 +1219,21 @@ def populate_seo_errors_slide(errors_slide, audit: dict | None, full_list_url: s
         if shape.shape_type == 13 and shape.left < 2000000 and shape.top > 1200000:
             target_pic = shape
             break
-    if audit and audit.get("top_issues"):
+
+    cropped = crop_top_issues_from_pdf(pdf_path)
+    if cropped is not None:
+        png_bytes, img_w, img_h = cropped
+    elif audit and audit.get("top_issues"):
+        png_bytes, img_w, img_h = render_top_issues_image(audit["top_issues"])
+    else:
+        png_bytes = None
+
+    if png_bytes is not None:
         if target_pic is not None:
             left, top, width = target_pic.left, target_pic.top, target_pic.width
             target_pic._element.getparent().remove(target_pic._element)
         else:
             left, top, width = 696125, 1827925, 4683900
-        png_bytes, img_w, img_h = render_top_issues_image(audit["top_issues"])
         new_height = int(width * (img_h / img_w))
         max_height = 5143500 - top - 250000
         if new_height > max_height:
@@ -1218,7 +1288,7 @@ def build(template: Path, pdf: Path | None, xlsx: Path, output: Path, full_list_
 
     benefits_slide = prs.slides[3]
     errors_slide = ensure_seo_errors_slide(prs)
-    populate_seo_errors_slide(errors_slide, audit_data, full_list_url)
+    populate_seo_errors_slide(errors_slide, audit_data, full_list_url, pdf_path=pdf)
 
     # Update Insights on Slide 2 before duplicating for overflow slides
     updated_insight = insights(tracked)
