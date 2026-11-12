@@ -432,29 +432,32 @@ def crawl_target_website(
     )
 
     if url:
+        # Clean accidental admin/login paths (e.g. /wp-admin/) back to the site root
+        url = re.sub(r"/(?:wp-admin|wp-login\.php).*$", "/", url, flags=re.I)
         parsed = urllib.parse.urlparse(url)
         slug_text = re.sub(r"[^a-z0-9]+", " ", parsed.path.lower())
         url_slug_chunks.append(slug_text)
 
         # Run sitemap discovery and homepage fetch concurrently within budget
         with ThreadPoolExecutor(max_workers=2) as pool:
-            sm_future = pool.submit(_discover_sitemap_urls, url, 2.5)
+            sm_future = pool.submit(_discover_sitemap_urls, url, 2.8)
             def _fetch_home() -> tuple[str, str]:
                 try:
-                    return _fetch_html(url, timeout=4.0)
+                    return _fetch_html(url, timeout=5.5)
                 except Exception:
                     return "", url
             home_future = pool.submit(_fetch_home)
             sitemap_urls = sm_future.result()
             html, final_url = home_future.result()
 
-        # If target_url points to a specific property path on a multi-property domain (e.g. marriott.com/.../mslbr-.../),
+        # If target_url points to a specific property path on a multi-property domain (e.g. arrivehotels.com/hotels/memphis or marriott.com/.../mslbr-.../),
         # scope sitemap URLs to that property so other properties on the chain domain don't pollute services
         path_parts = [p for p in parsed.path.strip("/").split("/") if p and p not in ("en", "en-us", "hotels", "hotel", "overview")]
-        if path_parts and len(sitemap_urls) > 150:
+        if path_parts and len(sitemap_urls) > 30:
             prop_key = path_parts[0].lower()
             scoped = [u for u in sitemap_urls if prop_key in u.lower()]
-            sitemap_urls = scoped
+            if scoped or len(sitemap_urls) > 150:
+                sitemap_urls = scoped
 
         sitemap_url_count = len(sitemap_urls)
         for sm_u in sitemap_urls:
