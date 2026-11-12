@@ -148,6 +148,43 @@
                 }
             };
 
+            const fetchWithTimeoutRetry = async (url, options, { timeoutMs = 55000, retries = 1 } = {}) => {
+                let lastErr;
+                for (let attempt = 0; attempt <= retries; attempt++) {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), timeoutMs);
+                    try {
+                        const response = await fetch(url, { ...options, signal: controller.signal });
+                        clearTimeout(timer);
+                        if ((response.status === 502 || response.status === 503) && attempt < retries) {
+                            await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+                            continue;
+                        }
+                        return response;
+                    } catch (err) {
+                        clearTimeout(timer);
+                        lastErr = err.name === "AbortError"
+                            ? new Error("The request timed out. Please try again.")
+                            : err;
+                        if (attempt < retries) {
+                            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+                            continue;
+                        }
+                    }
+                }
+                throw lastErr;
+            };
+
+            const validateUploadFile = (file, expectedExt, label) => {
+                if (!file) return;
+                if (!file.name.toLowerCase().endsWith(expectedExt)) {
+                    throw new Error(`${label} must be a ${expectedExt} file.`);
+                }
+                if (file.size > 5 * 1024 * 1024 && expectedExt !== ".xlsx") {
+                    throw new Error(`${label} exceeds the 5 MB upload limit.`);
+                }
+            };
+
             const parseJsonResponse = async (response, fallbackMsg) => {
                 const rawText = await response.text();
                 let data = null;
@@ -170,8 +207,9 @@
                 }
                 setError(""); setCrawlLoading(true);
                 try {
+                    validateUploadFile(xlsx, ".xlsx", "Keywords Workbook");
                     const { keywords, urls } = xlsx ? await slimWorkbookIfNeeded(xlsx) : { keywords: [], urls: [] };
-                    const response = await fetch("/crawl", {
+                    const response = await fetchWithTimeoutRetry("/crawl", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -198,6 +236,9 @@
                 }
                 setError(""); setSuccessMsg(""); setLoading(true);
                 try {
+                    validateUploadFile(template, ".pptx", "PowerPoint Template");
+                    validateUploadFile(xlsx, ".xlsx", "Keywords Workbook");
+                    validateUploadFile(pdf, ".pdf", "Semrush Audit PDF");
                     const { slimFile } = await slimWorkbookIfNeeded(xlsx);
                     const formData = new FormData();
                     formData.append("template", template);
@@ -205,7 +246,7 @@
                     if (pdf) formData.append("pdf", pdf);
                     if (targetUrl.trim()) formData.append("target_url", targetUrl.trim());
 
-                    const response = await fetch(API_ENDPOINT, { method: "POST", body: formData });
+                    const response = await fetchWithTimeoutRetry(API_ENDPOINT, { method: "POST", body: formData });
                     
                     if (!response.ok) {
                         await parseJsonResponse(response, "Failed to generate presentation.");
