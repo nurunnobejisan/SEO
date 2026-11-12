@@ -1134,7 +1134,9 @@ def keyword_rows(
     frame = frame[~frame["_normalized"].isin(tracked_names)]
     
     # Apply minimum search volume and realistic SERP ranking bound (top 50) before heavy string matching
-    frame = frame[(frame["_volume"] >= MIN_SEARCH_VOLUME) & (frame["_position"] <= 50)]
+    filtered_vol = frame[(frame["_volume"] >= MIN_SEARCH_VOLUME) & (frame["_position"] <= 50)]
+    if not filtered_vol.empty:
+        frame = filtered_vol
     if len(frame) > 1500:
         frame = frame.head(1500)
 
@@ -1159,21 +1161,37 @@ def keyword_rows(
         ]
 
     # Apply strict brand, client/restaurant name, and location-based filtering for Ancillary keywords
-    strict_frame = frame[
-        ~frame["_keyword"].apply(
+    base_frame = frame
+    strict_frame = base_frame[
+        ~base_frame["_keyword"].apply(
             lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs, strict_vocab=True)
         )
     ]
 
     if len(strict_frame) < MAX_ANCILLARY_KEYWORDS:
-        fallback_frame = frame[
-            ~frame["_keyword"].apply(
+        fallback_frame = base_frame[
+            ~base_frame["_keyword"].apply(
                 lambda kw: is_brand_excluded(kw, prop_name, prop_brands, target_locs, strict_vocab=False)
             )
         ]
         frame = pd.concat([strict_frame, fallback_frame]).drop_duplicates("_normalized")
     else:
         frame = strict_frame
+
+    # General non-branded fallback for non-hospitality websites (agencies, golf, events, corporate, etc.)
+    if frame.empty and not base_frame.empty:
+        def _is_non_branded_general(kw: str) -> bool:
+            kw_low = re.sub(r"[^a-z0-9\s]", " ", kw.lower()).strip()
+            kw_nospace = re.sub(r"[^a-z0-9]", "", kw.lower())
+            if re.search(r"\b\d{5}\b", kw_low):
+                return False
+            for bw in prop_brands:
+                if re.search(r"\b" + re.escape(bw) + r"\b", kw_low) or (len(bw) >= 4 and bw in kw_nospace):
+                    return False
+            return True
+
+        gen_frame = base_frame[base_frame["_keyword"].apply(_is_non_branded_general)]
+        frame = gen_frame if not gen_frame.empty else base_frame
 
     if allowed_services:
         svc_filtered = frame[
