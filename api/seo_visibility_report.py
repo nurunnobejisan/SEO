@@ -1133,12 +1133,18 @@ def keyword_rows(
     tracked_names = {item["name"].casefold() for item in tracked}
     frame = frame[~frame["_normalized"].isin(tracked_names)]
     
-    # Apply minimum search volume and realistic SERP ranking bound (top 50) before heavy string matching
-    filtered_vol = frame[(frame["_volume"] >= MIN_SEARCH_VOLUME) & (frame["_position"] <= 50)]
+    # Apply minimum search volume and SEO-actionable ranking range (1 to 40)
+    filtered_vol = frame[
+        (frame["_volume"] >= MIN_SEARCH_VOLUME)
+        & (frame["_position"] >= 1)
+        & (frame["_position"] <= 40)
+    ]
+    if filtered_vol.empty:
+        filtered_vol = frame[(frame["_position"] >= 1) & (frame["_position"] <= 40)]
     if not filtered_vol.empty:
-        frame = filtered_vol
+        frame = filtered_vol.copy()
     if len(frame) > 1500:
-        frame = frame.head(1500)
+        frame = frame.head(1500).copy()
 
     # Extract property brand identifiers and target location terms
     prop_brands, target_locs = extract_property_brand_and_locations(
@@ -1200,36 +1206,100 @@ def keyword_rows(
         if not svc_filtered.empty:
             frame = svc_filtered
 
-    # Select diverse location-based keywords (capping identical topic stems at 2 so 'near' & diverse terms appear)
-    candidates = []
-    for position, group in frame.groupby("_position", sort=True):
-        candidates.extend(group.head(4 if position <= 2 else 2).to_dict("records"))
+    # SEO-expert selection across ranks 1-40:
+    # 1. Deduplicate near-identical topic stems (keep strongest position & highest volume per topic)
+    # 2. Prioritize diverse service intents + high-demand terms across Page 1 (1-10) and growth tiers (11-40)
+    all_records = frame.to_dict("records")
 
-    topic_counts: dict[tuple, int] = {}
-    selected = []
-    overflow = []
-    for row in candidates:
+    def _seo_score(row: dict) -> float:
+        pos = max(1.0, float(row["_position"]))
+        vol = max(10.0, float(row["_volume"]))
+        import math as _math
+        # Balances strong ranking (1-10) with high search demand and striking-distance value (11-40)
+        return (42.0 - pos) * 1.4 + _math.log10(vol) * 18.0
+
+    def _primary_intent(kw: str) -> str:
+        kw_low = kw.lower()
+        if re.search(r"\bnear\b", kw_low):
+            return "near"
+        svcs = detect_services_in_text(kw_low)
+        for priority_svc in (
+            "waterfront", "wedding", "meetings_events", "venues", "suites",
+            "pet_friendly", "romantic", "family", "luxury", "boutique",
+            "resort", "spa", "pool", "dining", "breakfast", "packages_deals",
+        ):
+            if priority_svc in svcs:
+                return priority_svc
+        return "lodging"
+
+    all_records.sort(key=lambda r: (-_seo_score(r), int(r["_position"]), -int(r["_volume"])))
+
+    # Keep only the single best-scoring representative for each normalized topic stem
+    best_by_sig: dict[tuple, dict] = {}
+    for row in all_records:
         sig = _keyword_topic_signature(row["_keyword"], target_locs)
-        if topic_counts.get(sig, 0) < 2:
-            topic_counts[sig] = topic_counts.get(sig, 0) + 1
+        if sig not in best_by_sig:
+            best_by_sig[sig] = row
+        else:
+            # Prefer significantly higher search volume if both are in the 1-40 window
+            cur = best_by_sig[sig]
+            if int(row["_volume"]) >= int(cur["_volume"]) * 2 and int(row["_position"]) <= int(cur["_position"]) + 15:
+                best_by_sig[sig] = row
+
+    unique_pool = list(best_by_sig.values())
+    unique_pool.sort(key=lambda r: (-_seo_score(r), int(r["_position"]), -int(r["_volume"])))
+
+    selected: list[dict] = []
+    used_kws: set[str] = set()
+    intent_counts: dict[str, int] = {}
+
+    # Pass 1: Pick the top keyword from each distinct service intent (breadth across all offerings)
+    for row in unique_pool:
+        intent = _primary_intent(row["_keyword"])
+        if intent not in intent_counts:
             selected.append(row)
-        else:
-            overflow.append(row)
+            used_kws.add(row["_normalized"])
+            intent_counts[intent] = 1
+            if len(selected) >= MAX_ANCILLARY_KEYWORDS:
+                break
 
-    selected = selected[:MAX_ANCILLARY_KEYWORDS]
+    # Pass 2: Ensure at least 2 high-opportunity #11-40 keywords are included when available
     if len(selected) < MAX_ANCILLARY_KEYWORDS:
-        selected.extend(overflow[: MAX_ANCILLARY_KEYWORDS - len(selected)])
+        tier2_rows = [
+            r for r in unique_pool
+            if r["_normalized"] not in used_kws and 11 <= int(r["_position"]) <= 40
+        ]
+        tier2_rows.sort(key=lambda r: (-int(r["_volume"]), int(r["_position"])))
+        for row in tier2_rows[:2]:
+            intent = _primary_intent(row["_keyword"])
+            if intent_counts.get(intent, 0) < 3:
+                selected.append(row)
+                used_kws.add(row["_normalized"])
+                intent_counts[intent] = intent_counts.get(intent, 0) + 1
+                if len(selected) >= MAX_ANCILLARY_KEYWORDS:
+                    break
 
-    # Ensure at least one 'near' location keyword is included when available in the filtered set
-    near_rows = [
-        r for r in frame.to_dict("records")
-        if re.search(r"\bnear\b", r["_keyword"].lower())
-    ]
-    if near_rows and not any(re.search(r"\bnear\b", r["_keyword"].lower()) for r in selected):
-        if len(selected) >= MAX_ANCILLARY_KEYWORDS:
-            selected[-1] = near_rows[0]
-        else:
-            selected.append(near_rows[0])
+    # Pass 3: Fill remaining slots up to 10, capping any single intent at 3 for balanced variety
+    if len(selected) < MAX_ANCILLARY_KEYWORDS:
+        for row in unique_pool:
+            if row["_normalized"] in used_kws:
+                continue
+            intent = _primary_intent(row["_keyword"])
+            if intent_counts.get(intent, 0) < 3:
+                selected.append(row)
+                used_kws.add(row["_normalized"])
+                intent_counts[intent] = intent_counts.get(intent, 0) + 1
+                if len(selected) >= MAX_ANCILLARY_KEYWORDS:
+                    break
+
+    # Pass 4: If still under 10, fill from remaining unique_pool
+    if len(selected) < MAX_ANCILLARY_KEYWORDS:
+        for row in unique_pool:
+            if row["_normalized"] not in used_kws:
+                selected.append(row)
+                used_kws.add(row["_normalized"])
+                if len(selected) >= MAX_ANCILLARY_KEYWORDS:
+                    break
 
     selected.sort(key=lambda r: (int(r["_position"]), -int(r["_volume"])))
     rows = [{"keyword": row["_keyword"], "position": int(row["_position"]), "volume": int(row["_volume"])} for row in selected]
